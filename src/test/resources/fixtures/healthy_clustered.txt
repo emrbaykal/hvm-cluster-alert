@@ -1,0 +1,23 @@
+@@ID 0 2026-11-04T18:46:36Z
+@@PRIV root
+@@GFS2MOUNTS 2
+@@QUORUM_API
+[{"hostname":"host2","keyHash":"aaaa","dlmNodeId":"2","lastReachedDate":"2026-11-04T18:46:18.820Z","addresses":["10.0.0.22"],"me":false,"serverTime":1793817996603},{"hostname":"host3","keyHash":"bbbb","dlmNodeId":"3","lastReachedDate":"2026-11-04T18:46:18.820Z","addresses":["10.0.0.23"],"me":false,"serverTime":1793817996603},{"hostname":"host1","keyHash":"cccc","dlmNodeId":"1","lastReachedDate":"2026-11-04T18:46:18.817Z","addresses":["10.0.0.21"],"me":true,"serverTime":1793817996603}]
+@@DLM
+cluster nodeid 1 quorate 1 ring seq 60 60
+daemon now 104799 fence_pid 0 
+node 1 M add 41 rem 0 fail 0 fence 0 at 0 0
+node 2 M add 4276 rem 4001 fail 40 fence 97 at 2 1793713291
+@@GFS2
+cls:vme_ds01 0
+cls:vme_ds02 0
+@@MPATH
+360002ac0000000000000000100000abc|sda|active|ready
+360002ac0000000000000000100000abc|sdc|active|ready
+360002ac0000000000000000100000abc|sde|active|ready
+360002ac0000000000000000100000abc|sdg|active|ready
+@@LOG 131075 52428800
+@@LOGDATA
+Q 2026-11-04T18:45:14.416Z [pool-1-thread-1189] [] INFO  com.morpheus.agent.ActionHandler - handleAction results: {data={quorumAchieved=true, fenced=false, agentStartDate=1793713236011, corosyncActive=true, dlmActive=true, corosyncQuorate=true, totalNodes=3, reachableNodes=3, nodes=[{hostname=host2, addresses=[10.0.0.22], site=null, me=false, witnessOnly=false, witnessUrl=null, lastReachedDate=1793817898819, reachable=true, down=false, dlm={nodeId=2, member=true, needFencing=false, leftReason=startup, fenceWalltime=1793713291}}]}}
+E 2026-11-03T18:38:40.100Z [pool-1-thread-9] [] WARN  c.m.agent.stats.MvmHeartbeatFailover - Host host3 is offline, moving vms
+@@END

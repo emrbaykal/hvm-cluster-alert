@@ -1,0 +1,23 @@
+@@ID 0 2026-11-04T19:00:00Z
+@@PRIV root
+@@GFS2MOUNTS 2
+@@QUORUM_API
+[{"hostname":"host2","lastReachedDate":"2026-11-04T18:59:50.000Z","me":false,"serverTime":1793818800000},{"hostname":"host3","lastReachedDate":"2026-11-04T18:57:00.000Z","me":false,"serverTime":1793818800000},{"hostname":"host1","lastReachedDate":"2026-11-04T19:00:00.000Z","me":true,"serverTime":1793818800000}]
+@@DLM
+cluster nodeid 1 quorate 0 ring seq 61 61
+daemon now 105000 fence_pid 4321 
+@@GFS2
+cls:vme_ds01 1
+cls:vme_ds02 0
+@@MPATH
+360002ac0000000000000000100000abc|sda|active|ready
+360002ac0000000000000000100000abc|sdc|failed|faulty
+360002ac0000000000000000200000abc|sdb|failed|faulty
+360002ac0000000000000000200000abc|sdd|failed|faulty
+@@LOG 131075 52428800
+@@LOGDATA
+Q 2026-11-04T18:59:30.000Z [pool-1-thread-1] [] INFO  com.morpheus.agent.ActionHandler - handleAction results: {data={quorumAchieved=false, fenced=false, corosyncActive=true, dlmActive=true, corosyncQuorate=false, totalNodes=3, reachableNodes=2, nodes=[{hostname=host3, reachable=false, down=true, dlm={nodeId=3, member=false, needFencing=true}}]}}
+E 2026-11-04T18:58:10.000Z [pool-1-thread-7] [] WARN  c.m.a.services.QuorumCheckService - Host host3 is unreachable, taking action
+E 2026-11-04T18:58:20.000Z [pool-1-thread-7] [] ERROR c.m.agent.stats.MvmHeartbeatFailover - Failed to write heartbeat file for host host1, on all heartbeat targets.
+E 2026-11-04T18:58:30.000Z [pool-1-thread-7] [] WARN  c.m.agent.stats.MvmHeartbeatFailover - Hosts cccc have failed to update heartbeat in 61000 milliseconds
+@@END

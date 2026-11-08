@@ -1,0 +1,12 @@
+@@ID 0 2026-11-07T13:00:00Z
+@@PRIV root
+@@GFS2MOUNTS 0
+@@QUORUM_API
+curl: (7) Failed to connect to localhost port 7443
+@@DLM
+dlm_tool: cannot connect to dlm_controld
+@@GFS2
+@@MPATH
+@@LOG 131075 52428800
+@@LOGDATA
+@@END

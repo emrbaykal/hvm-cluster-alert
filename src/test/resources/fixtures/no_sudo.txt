@@ -1,0 +1,9 @@
+@@ID 1000 2026-11-07T13:00:00Z
+@@PRIV none
+@@GFS2MOUNTS 1
+@@QUORUM_API
+[{"hostname":"host1","lastReachedDate":"2026-11-07T13:00:00.000Z","me":true,"serverTime":1793970000000}]
+@@DLM
+@@GFS2
+@@MPATH
+@@LOG

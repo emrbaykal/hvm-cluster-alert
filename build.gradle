@@ -1,0 +1,57 @@
+plugins {
+    id 'java'
+    id 'groovy'
+    // Gradle 7.x-compatible shadow plugin (the older 'plugin-shadow 2.0.3' is Gradle 6.x only).
+    id 'com.github.johnrengelman.shadow' version '7.1.2'
+}
+
+group   = 'com.hpe.hvmalert'
+// Bump on every revision so the operator can identify which build is loaded. History: CHANGELOG.md.
+version = '1.19.0'
+
+// morpheus-plugin-api is compiled for Java 11; a Java 8 target fails variant matching.
+sourceCompatibility = '11'
+targetCompatibility = '11'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // Plugin API 1.4.1: tested on VME 9.0.2.
+    compileOnly 'com.morpheusdata:morpheus-plugin-api:1.4.1'
+    compileOnly 'org.codehaus.groovy:groovy-all:3.0.11'
+    compileOnly 'io.reactivex.rxjava3:rxjava:3.1.5'
+    compileOnly 'org.slf4j:slf4j-api:1.7.26'
+
+    // Unit tests cover the pure parts (host output parser, state diff, mail body); no Morpheus runtime.
+    testImplementation 'org.codehaus.groovy:groovy:3.0.11'
+    testImplementation 'org.codehaus.groovy:groovy-json:3.0.11'
+    testImplementation('com.morpheusdata:morpheus-plugin-api:1.4.1') { transitive = false }   // OptionType in AlertSettings
+    testImplementation 'org.slf4j:slf4j-api:1.7.26'                    // @Slf4j classes in the scheduler test
+    testImplementation 'io.reactivex.rxjava3:rxjava:3.1.5'
+    testImplementation 'com.fasterxml.jackson.core:jackson-databind:2.15.2'   // model classes (ComputeServer) in tests
+    testImplementation 'jakarta.servlet:jakarta.servlet-api:6.0.0'          // ViewModel (1.4.x) in controller tests
+    testImplementation 'junit:junit:4.13.2'
+}
+
+jar {
+    manifest {
+        attributes(
+            'Plugin-Class':   'com.hpe.hvmalert.HvmClusterAlertPlugin',
+            'Plugin-Version': archiveVersion.get()
+        )
+    }
+}
+
+// The fat JAR is what Morpheus loads and it does not inherit the jar block's manifest.
+shadowJar {
+    manifest {
+        attributes(
+            'Plugin-Class':   'com.hpe.hvmalert.HvmClusterAlertPlugin',
+            'Plugin-Version': archiveVersion.get()
+        )
+    }
+}
+
+tasks.assemble.dependsOn tasks.shadowJar
