@@ -7,8 +7,8 @@ problems.
 It changes nothing in Morpheus or on the hosts. It writes only a 0-byte lock file per host
 (`/run/hvm-cluster-alert.lock`) and its own Cypher keys.
 
-> Community plugin, not an HPE product and not supported by HPE. Use at your own risk; read "Tested" and "Known
-> limitations" before running it on a production cluster.
+> Community plugin, not an HPE product and not supported by HPE. Use at your own risk; read "Known limitations"
+> before running it on a production cluster.
 
 ## Requirements
 
@@ -156,26 +156,6 @@ day. Worth knowing if auth.log goes to a SIEM.
 - Every change is logged with the user's name.
 - Anyone with Tools: Cypher access in the tenant can also change the keys there, and the plugin does not log that.
 - The host script is fixed and read-only. Only numbers from the plugin's own state go into it.
-
-## Tested
-
-On a 3-host VME 9.0.2 lab (layout 1.3, FC, GFS2, agent 3.3.0):
-
-| Test | Result |
-|---|---|
-| Maintenance mode | No false alert in or out of maintenance |
-| Host reboot | Critical mail 2 min 17 s after the reboot (peer not reached, peer unreachable, fence_ack); resolved after the host returned |
-| Storage cut on one host | All paths down and GFS2 withdraw mailed 1 min 35 s after the cut. The agent's budget, VM-shutdown and self-reboot lines followed in the same incident |
-| Plugin upload during operation | The new version took over in about 60 s |
-
-Not tested:
-
-- a storage cut with running VMs, so neither the actual VM shutdown nor the pinned-VM exception was seen;
-- a full run on agent 4.x or layout 2.0;
-- a stretch cluster;
-- a multi-node manager;
-- a cluster in a sub-tenant, or a master-tenant user saving a sub-tenant's cluster;
-- clusters larger than 3 hosts.
 
 ## Known limitations
 
