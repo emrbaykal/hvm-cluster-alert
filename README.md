@@ -14,13 +14,11 @@ It changes nothing in Morpheus or on the hosts. It writes only a 0-byte lock fil
 
 | | |
 |---|---|
-| Appliance | VM Essentials manager, tested on **9.0.2** (single manager VM) |
-| Clusters | HVM clusters, tested on layout 1.3 (HVM OS 24.04, Morpheus agent 3.3.0) with GFS2 datastores on FC. The host-output parser also covers layout 2.0 output from agent 4.0.1, but a full run there is not tested |
+| Appliance | VM Essentials manager, tested on **9.0.2** (single manager VM); Morpheus Enterprise **9.1.0.1** with three app nodes |
+| Clusters | HVM clusters, tested on layout 1.3 (HVM OS 24.04, Morpheus agent 3.3.0) with GFS2 datastores on FC, and on layout 2.0 (HVM OS 26.04, agent 4.0.1) with an NFS heartbeat datastore. Quorum, DLM and GFS2 checks run only where the cluster has GFS2 datastores, so they were not exercised on layout 2.0 |
 | Mail | Administration > Settings > Email filled in; `morpheus-ui` restarted after a change (the plugin reads the SMTP settings that Morpheus loaded at start) |
 | Permissions | To save a cluster's settings: role permission **Clusters: Full** and access to that cluster's page |
 | Build (only to build from source) | JDK 11 to 17 (Gradle 7.6.4 wrapper). Plugin API `morpheus-plugin-api:1.4.1`, Groovy |
-
-Morpheus Enterprise managing HVM clusters is not supported by this release.
 
 ## Install
 
