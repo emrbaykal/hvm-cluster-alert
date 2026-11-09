@@ -132,8 +132,11 @@ these lines while DLM holds GFS2 until a fence. It also stays silent when anothe
 
 Per check and host:
 
-- one agent command; the script itself runs in about 0.07 s on the host (measured on three layout 1.3 hosts, max 0.09 s);
-- the agent log, read from the last offset (100 to 300 KB; 4 MB on the first check after a start);
+- one agent command; the script runs in about 0.06 s and uses 0.05 to 0.07 s of CPU, its largest process about 13 MB of
+  memory (measured on layout 1.3 hosts);
+- the agent log, read from the last offset (about 0.5 MB per check on the lab hosts; up to 4 MB on the first check after a
+  start);
+- about 2 KB of output back to the manager on a quiet check; the output is capped at roughly 100 KB;
 - every root command runs under `timeout -k 2 6`, and only one copy runs per host (flock).
 
 The agent runs the script through sudo, so each check adds about 6 KB per host to the host's auth.log, about 4.3 MB a
@@ -141,7 +144,8 @@ day; on the lab hosts that was 6 to 10 % of the file, the rest being the agent's
 auth.log goes to a SIEM.
 
 On the manager, the plugin thread used about 12 ms of CPU per check on the node running the checks and a few ms per
-interval on the others (Morpheus Enterprise 9.1.0.1, three app nodes, one 2-host cluster).
+interval on the others, and the plugin's objects took under 20 KB of heap, with about 150 classes loaded (Morpheus
+Enterprise 9.1.0.1, three app nodes, one 2-host cluster).
 
 ## Security model
 
