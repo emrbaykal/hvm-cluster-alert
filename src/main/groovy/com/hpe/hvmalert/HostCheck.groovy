@@ -272,7 +272,7 @@ echo '@@END'
                 String q = r.quorumLine ?: (ctx.lastQuorumLine as String)
                 // with a /quorum node list the peer ages (pinged every 20 s) already report a lost host; the map's
                 // reachable/down-hosts counts lag ~2-4 min and doubled every host loss (VME lab T2/T3, 2026-11-08)
-                if (!parseAgentQuorum(q, nowMs, fencing, add, nodeList)) {
+                if (!parseAgentQuorum(q, nowMs, fencing, add, nodeList, r.quorumLine != null)) {
                     add('quorum-unknown', Finding.WARNING, 'Agent quorum state unknown',
                             "No agent quorum line newer than ${AGENT_QUORUM_MAX_AGE_MS.intdiv(60000L)} min in ${AGENT_LOG}; quorum cannot be confirmed.")
                 }
@@ -313,7 +313,10 @@ echo '@@END'
         if (json instanceof Map) {
             // Documented shape (monitoring.rst:52-61).
             Map q = (Map) json
-            if (q.quorumAchieved == false) add('quorum', Finding.CRITICAL, 'Quorum lost', 'Agent quorum endpoint reports quorumAchieved=false.', [confirm: 1])
+            if (q.quorumAchieved == false) {
+                boolean allReached = q.reachableNodes instanceof Number && q.totalNodes instanceof Number && q.reachableNodes >= q.totalNodes
+                add('quorum', Finding.CRITICAL, 'Quorum lost', 'Agent quorum endpoint reports quorumAchieved=false.', [confirm: allReached ? 2 : 1])
+            }
             if (q.fenced == true) add('fenced', Finding.CRITICAL, 'Host is fenced', 'Agent quorum endpoint reports fenced=true.', [confirm: 1])
             if (q.waitFencing == true) add('dlm-wait', Finding.CRITICAL, 'DLM waiting on fencing', 'Agent quorum endpoint reports waitFencing=true.', [hold: fencingSeconds, confirm: 1])
             if (q.reachableNodes instanceof Number && q.totalNodes instanceof Number && q.reachableNodes < q.totalNodes) {
@@ -350,7 +353,8 @@ echo '@@END'
      * the nodes=[...] list (waitFencing and downHosts follow it, agent 4.0.1); the node entries are skipped.
      * @return false when there is no quorum line or it is older than AGENT_QUORUM_MAX_AGE_MS (state unknown)
      */
-    static boolean parseAgentQuorum(String line, long nowMs, int fencingSeconds, Closure add, boolean skipHostCounts = false) {
+    static boolean parseAgentQuorum(String line, long nowMs, int fencingSeconds, Closure add, boolean skipHostCounts = false,
+                                    boolean fresh = true) {
         if (!line?.contains('quorumAchieved=')) return false
         Long ts = parseTime(line.trim().split(/\s+/)[0])
         if (ts == null || nowMs - ts > AGENT_QUORUM_MAX_AGE_MS) return false
@@ -370,12 +374,19 @@ echo '@@END'
             }
         }
         def val = { String k -> def m = top =~ /\b${k}=([A-Za-z0-9]+)/; m.find() ? m.group(1) : null }
-        if (val('quorumAchieved') == 'false') add('quorum', Finding.CRITICAL, 'Quorum lost', 'Agent reports quorumAchieved=false.', [confirm: 1])
+        String reach = val('reachableNodes'), total = val('totalNodes')
+        // a host rejoining after its own restart logs one quorumAchieved=false with every node reachable (VME lab, layout
+        // 1.3, agent 3.3.0, two sysrq reboots 2026-11-09; true 2 min later; layout 2.0 and stretch unverified): with all
+        // nodes reachable it needs a second cycle with a newly read line, so a line kept from an earlier cycle cannot
+        // confirm it
+        boolean allReached = reach?.isInteger() && total?.isInteger() && (reach as int) >= (total as int)
+        if (val('quorumAchieved') == 'false' && (fresh || !allReached)) {
+            add('quorum', Finding.CRITICAL, 'Quorum lost', 'Agent reports quorumAchieved=false.', [confirm: allReached ? 2 : 1])
+        }
         if (val('fenced') == 'true') add('fenced', Finding.CRITICAL, 'Host is fenced', 'Agent reports fenced=true.', [confirm: 1])
         if (val('waitFencing') == 'true') add('dlm-wait', Finding.CRITICAL, 'DLM waiting on fencing', 'Agent reports waitFencing=true.', [hold: fencingSeconds, confirm: 1])
         if (val('dlmActive') == 'false') add('dlm-active', Finding.CRITICAL, 'DLM not active', 'Agent reports dlmActive=false.')
         if (val('corosyncActive') == 'false') add('corosync-active', Finding.CRITICAL, 'Corosync service not active', 'Agent reports corosyncActive=false; DLM depends on it.')
-        String reach = val('reachableNodes'), total = val('totalNodes')
         if (!skipHostCounts && reach?.isInteger() && total?.isInteger() && (reach as int) < (total as int)) {
             add('reachable', Finding.CRITICAL, "Only ${reach} of ${total} nodes reachable", 'Agent quorum state.',
                     [confirm: 1, meta: [missing: (total as int) - (reach as int)]])

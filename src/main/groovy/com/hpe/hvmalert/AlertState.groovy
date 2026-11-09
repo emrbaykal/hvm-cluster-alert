@@ -30,6 +30,12 @@ class AlertState {
     static final long PEER_LOSS_WINDOW_MS = 5 * 60000L
     /** How long a finding seen once is kept while its host cannot be read (not across a long maintenance). */
     static final long PENDING_CARRY_MS = 10 * 60000L
+    /** Widening of a host's maintenance period for its agent-log lines: interval + tick + cycle deadline, plus clock slack. */
+    static final long MAINT_EVENT_MARGIN_MS = 4 * 60000L
+    /** More than this between two down sightings of a maintenance host starts a new down episode. */
+    static final long MAINT_EPISODE_GAP_MS = 5 * 60000L
+    /** A host's maintenance record is forgotten this long after it left maintenance. */
+    static final long MAINT_KEEP_MS = 30 * 60000L
 
     static class Diff {
         List<Finding> opened = []
@@ -66,6 +72,8 @@ class AlertState {
     Map<Long, Integer> lastGfs2 = [:]       // cluster id -> GFS2 datastores counted last time
     Map<Long, List> logPos = [:]            // host id -> [inode, size] where the agent log was last read
     Map<Long, String> quorumLine = [:]      // host id -> newest agent quorum line seen
+    Set<Long> hostNoAnswer = [] as Set      // hosts whose last check got no answer from the agent within the timeout
+    Map<Long, Map> maintenance = [:]        // host id -> [clusterId, names, enteredMs, seenMs (first/last cycle in maintenance), firstDownMs, downMs]
     Map<Long, ClusterMail> mail = [:]       // by cluster id
 
     /**
@@ -195,6 +203,36 @@ class AlertState {
         apdReportedMs[hostId] = lastMs
     }
 
+    /** Records that the host is in maintenance in this cycle; a new maintenance period starts a new record. */
+    void maintenanceSeen(Long hostId, Long clusterId, Set<String> names, long nowMs) {
+        Map m = maintenance[hostId]
+        // a new period only after the host was seen out of full maintenance, so skipped cycles cannot split one period
+        if (m == null || m.left || nowMs - (m.seenMs as long) > MAINT_KEEP_MS) maintenance[hostId] = m = [enteredMs: nowMs, firstDownMs: null, downMs: null]
+        m.clusterId = clusterId
+        m.names = names
+        m.seenMs = nowMs
+    }
+
+    /** Records that a host is seen out of full maintenance; its record stays for its late lines until MAINT_KEEP_MS. */
+    void maintenanceLeft(Long hostId) {
+        Map m = maintenance[hostId]
+        if (m != null) m.left = true
+    }
+
+    /** Records that a host in maintenance is seen down (not reachable) in this cycle. */
+    void maintenanceDown(Long hostId, long nowMs) {
+        Map m = maintenance[hostId]
+        if (m == null) return
+        if (m.downMs == null || nowMs - (m.downMs as long) > MAINT_EPISODE_GAP_MS) m.firstDownMs = nowMs
+        m.downMs = nowMs
+    }
+
+    /** The cluster's hosts in maintenance now or within MAINT_KEEP_MS; older records are dropped. */
+    Map<Long, Map> maintenanceWindows(Long clusterId, long nowMs) {
+        maintenance.entrySet().removeIf { nowMs - (it.value.seenMs as long) > MAINT_KEEP_MS }
+        maintenance.findAll { Long id, Map m -> m.clusterId == clusterId }
+    }
+
     void reset() {
         active.clear()
         firstSeen.clear()
@@ -207,6 +245,8 @@ class AlertState {
         lastGfs2.clear()
         logPos.clear()
         quorumLine.clear()
+        hostNoAnswer.clear()
+        maintenance.clear()
         mail.clear()
     }
 }

@@ -102,16 +102,18 @@ healthy cluster (HPE troubleshooting guide). Quorum, DLM and GFS2 checks run whe
 
 **Possible APD (derived).** Where the agent's own lines are missing, the plugin raises a warning when one host logs 6
 consecutive "on all heartbeat targets" failures. It raises a critical when that host also has all multipath paths down
-or a withdrawn GFS2. It stays silent when the host itself reported a peer loss within 5 minutes, because survivors log
-these lines while DLM holds GFS2 until a fence. It also stays silent when another host lost its storage at that time.
+or a withdrawn GFS2. It stays silent when the host itself reported a peer loss within 5 minutes, because survivors log these lines while
+DLM holds GFS2 until a fence. As a precaution it also stays silent within 5 minutes of a host in maintenance going
+down (in a lab restart in maintenance the other hosts' heartbeat writes did not fail). It also stays silent when another host lost its storage at that time.
 
 ## Behaviour
 
 - **Timing**
   - Checks run every 2 minutes.
   - A problem opens after 2 consecutive checks and resolves after 2 checks without it. Conditions whose source already
-    waited (quorum lost, fenced, GFS2 withdraw, all paths down, peer age, agent silent, DLM wait) open on the first
-    check.
+    waited (quorum lost, fenced, GFS2 withdraw, all paths down, peer age, agent silent, DLM wait, a host in maintenance
+    seen down) open on the first check. A "quorum lost" logged while every node is reachable, as a host logs once when
+    it rejoins after a restart, needs a second check with a new line.
   - HVM alarms and agent-log events are mailed as they come.
 - **Mail**
   - One mail per cluster to its recipients, carrying what is new, what changed severity, what resolved and the events.
@@ -125,6 +127,14 @@ these lines while DLM holds GFS2 until a fence. It also stays silent when anothe
   - A relay that refuses one recipient does not block the others.
 - **Hosts**
   - Hosts in maintenance are not checked, and what other hosts report about them is dropped.
+  - A host fully in maintenance that goes down (a restart, say) gets one warning, "Host in maintenance not reachable",
+    resolved when it is back. It is a warning because its pinned VMs are down and not failed over, and it still counts
+    toward quorum.
+  - Not mailed for such a host: the other hosts' agent-log lines naming it (peer unreachable, fence_ack, HA failover,
+    heartbeat), for the whole maintenance period; the anonymous heartbeat warnings, within 5 minutes of it going down
+    and only while no other host shows a loss of its own; its own agent-log lines from the maintenance period, read when
+    it is checked again. The period starts 4 minutes before the host was first seen fully in maintenance and ends 4
+    minutes after it was last seen there. A host still evacuating ("maintenancing") keeps its events.
   - A host whose check cannot run keeps its open problems; they are not reported as resolved.
 - **Leadership.** A distributed lock picks the node that checks and mails. On a single manager VM that is the manager.
 
@@ -171,6 +181,9 @@ Enterprise 9.1.0.1, three app nodes, one 2-host cluster).
   a page served by another node shows "No check result yet".
 - **Manager on the watched cluster.** A manager VM running on the cluster it watches cannot mail the loss of its own
   host until it is running again.
+- **Restart in maintenance and a plugin reload.** The plugin keeps its maintenance records in memory. After an upload or
+  a `morpheus-ui` restart, the "monitor started" mail can list the other hosts' lines about a maintenance restart of the
+  last 15 minutes as earlier events.
 - **Tab visibility.** Anyone who can open a cluster's page sees its recipients and who last saved the settings.
 
 ## License

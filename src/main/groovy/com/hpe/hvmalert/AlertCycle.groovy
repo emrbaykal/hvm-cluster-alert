@@ -73,6 +73,7 @@ class AlertCycle {
         List<Map> maintenanceHosts = []          // [id, names (short), off (power not on)]
         int expectedGfs2
         List<Map> apdCandidates = []             // consecutive heartbeat-failure runs found this cycle
+        Set<String> otherHostNames = [] as Set   // short names of the cluster's hosts not in maintenance
     }
 
     /**
@@ -182,13 +183,24 @@ class AlertCycle {
         }
         log.debug("[hvm-cluster-alert] cluster ${c.name}: ${hosts.size()} hosts, ${w.expectedGfs2} GFS2 datastores expected")
         hosts.each { ComputeServer h ->
+            Set<String> names = [h.name, h.hostname].findAll { it }.collect { shortName(it as String) } as Set
             if (inMaintenance(h)) {
-                w.maintenanceHosts << [id: h.id, names: [h.name, h.hostname].findAll { it }.collect { shortName(it as String) } as Set,
-                                       ips: [h.externalIp, h.internalIp].findAll { it } as Set, off: h.powerState?.toString() != 'on']
+                // only a host fully in maintenance (evacuated) gets the single warning; one still evacuating
+                // ("maintenancing", host_maintenance.rst:39) that fails takes running VMs down, so its events stay
+                boolean full = h.status?.toLowerCase() == 'maintenance'
+                Map m = [id: h.id, name: h.name, names: names, full: full,
+                         ips: [h.externalIp, h.internalIp].findAll { it } as Set, off: h.powerState?.toString() != 'on',
+                         power: h.powerState?.toString(),
+                         silentMin: h.lastAgentUpdate ? (nowMs - h.lastAgentUpdate.time).intdiv(60000L) : null]
+                w.maintenanceHosts << m
+                if (full) state.maintenanceSeen(h.id, c.id, names, nowMs)
+                else state.maintenanceLeft(h.id)
                 o.carry << "hc:${h.id}:".toString()
                 o.carry << "host:${h.id}:".toString()
                 return
             }
+            w.otherHostNames.addAll(names)
+            state.maintenanceLeft(h.id)
             boolean reachable = managerHostChecks(c, h, w.rule, nowMs, o)
             if (w.rule.hostChecks) {
                 if (reachable) w.runHosts << h
@@ -200,8 +212,110 @@ class AlertCycle {
 
     void finish(Work w, Map<Long, Object> results, Outcome o) {
         w.runHosts.each { ComputeServer h -> hostResult(w, h, results[h.id], o) }
-        if (w.maintenanceHosts) dropMaintenanceFindings(w.cluster.id, w.maintenanceHosts, o.findings)
-        evaluateApd(w, o, System.currentTimeMillis())
+        long nowMs = System.currentTimeMillis()
+        if (w.maintenanceHosts) {
+            maintenanceUnreachable(w, o, nowMs)          // before the drop: the survivors' peer findings are evidence
+            dropMaintenanceFindings(w.cluster.id, w.maintenanceHosts, o.findings)
+        }
+        evaluateApd(w, o, nowMs)
+        dropMaintenanceEvents(w, o, nowMs)               // after evaluateApd, which reads these events as peer loss
+    }
+
+    static final String MAINT_RULE_TITLE = 'Host in maintenance not reachable'
+
+    /** @return true when the agent-log line names the host (short name, FQDN or the agent's "-<n>" suffix) */
+    static boolean namesHost(String line, Collection<String> names) {
+        names.any { String n ->
+            n && (line =~ /(?i)(?<![A-Za-z0-9-])${java.util.regex.Pattern.quote(n)}(?:-\d+)?(?![A-Za-z0-9-])/).find()
+        }
+    }
+
+    /**
+     * A host restarted in maintenance gets one WARNING instead of the peer-loss findings and events about it: opened while
+     * the manager or the other hosts see it down, resolved when they no longer do. A warning, not less: its pinned VMs are
+     * down and not failed over (vm_placement.rst:30-31), and it still counts toward quorum (host_maintenance.rst:120).
+     * The key is outside the "host:<id>:" prefix, which is carried (kept open) while the host is in maintenance.
+     * Agent silence alone (below the critical threshold) needs two cycles, as for any host, so one late check-in mails
+     * nothing. Sets m.down for dropMaintenanceFindings.
+     */
+    void maintenanceUnreachable(Work w, Outcome o, long nowMs) {
+        Long cid = w.cluster.id
+        int warnMin = w.rule.agentWarnMinutes
+        w.maintenanceHosts.findAll { it.full }.each { Map m ->
+            Set<String> names = m.names as Set<String>
+            Set<String> ips = (m.ips ?: []) as Set<String>
+            List<String> why = []
+            if (m.off) why << "power state ${m.power ?: 'unknown'}".toString()
+            boolean silent = m.silentMin != null && (m.silentMin as long) >= warnMin
+            if (silent) why << "agent silent for ${m.silentMin} min".toString()
+            List<String> reporters = o.findings.findAll { Finding f ->
+                f.clusterId == cid && f.key.startsWith('hc:') && (
+                        (f.meta.peer && names.any { sameHost(f.meta.peer as String, it) }) ||
+                        ((f.meta.addresses ?: []) as List).any { ips.contains(it?.toString()) } ||
+                        ((f.meta.hosts ?: []) as List).any { hn -> names.any { sameHost(hn as String, it) } })
+            }.collect { it.resource as String }.unique()
+            if (reporters) why << "not reached by ${reporters.join(', ')}".toString()
+            boolean loggedLoss = o.events.any { Finding e ->
+                e.clusterId == cid && (e.meta.rule in ['peer-unreachable', 'failover']) && namesHost(e.detail ?: '', names)
+            }
+            if (loggedLoss && !reporters) why << 'reported unreachable in the agent log of another host'
+            if (!why) return
+            boolean silenceOnly = !m.off && !reporters && !loggedLoss && (m.silentMin as long) < w.rule.agentCriticalMinutes
+            m.down = true
+            if (!silenceOnly) state.maintenanceDown(m.id as Long, nowMs)    // one late check-in starts no down episode
+            o.findings << new Finding(key: "maint:${m.id}:unreachable", severity: Finding.WARNING, clusterId: cid, cluster: w.cluster.name,
+                    resource: m.name as String, title: MAINT_RULE_TITLE,
+                    detail: "${why.join('; ')}. The host is in maintenance mode: the other hosts' reports about it (peer loss, fencing, HA failover, heartbeat) are not mailed.".toString(),
+                    source: 'manager', confirmCycles: silenceOnly ? 2 : 1)
+        }
+    }
+
+    /** Rules whose lines on another host are dropped when they name the maintenance host. */
+    static final Set<String> NAMED_DROP_RULES = ['peer-unreachable', 'failover', 'fence-ack', 'hb-late', 'hb-all', 'hb-path'] as Set
+    static final Set<String> FENCE_WINDOW_RULES = ['hb-late', 'hb-all', 'hb-path', 'fence-ack'] as Set
+
+    /**
+     * Agent-log events that belong to a maintenance restart are not mailed. "In the period" means logged between the
+     * first and the last cycle the host was seen fully in maintenance, each widened by MAINT_EVENT_MARGIN_MS (late
+     * lines, cycle spacing, host clocks):
+     * - lines from the maintenance host itself, logged in the period (read when it comes back);
+     * - peer-loss, fence_ack and heartbeat lines of other hosts that name it, logged in the period;
+     * - fencing-window warnings that name no other host of the cluster (heartbeat not updated by a heartbeat id,
+     *   heartbeat write failed, unhealthy heartbeat path, fence_ack), logged in the period within 5 min of the start
+     *   of the host's down episode, as long as no other host of the cluster shows a loss of its own.
+     */
+    void dropMaintenanceEvents(Work w, Outcome o, long nowMs) {
+        Long cid = w.cluster.id
+        Map<Long, Map> recent = state.maintenanceWindows(cid, nowMs)
+        if (!recent) return
+        long margin = AlertState.MAINT_EVENT_MARGIN_MS
+        Closure<Boolean> inPeriod = { Map m, Long t ->
+            t != null && t >= (m.enteredMs as long) - margin && t <= (m.seenMs as long) + margin
+        }
+        o.events.removeIf { Finding e ->
+            if (e.clusterId != cid) return false
+            Long t = e.since?.time
+            recent.any { Long hid, Map m ->
+                inPeriod(m, t) && (e.key.startsWith("event:${hid}:") ||
+                        (NAMED_DROP_RULES.contains(e.meta.rule) && namesHost(e.detail ?: '', m.names as Set<String>)))
+            }
+        }
+        Set<Long> maintIds = recent.keySet()
+        boolean otherLoss = o.findings.any { Finding f ->
+            if (f.clusterId != cid) return false
+            def k = f.key =~ /^(?:hc|host):(\d+):(peer:.*|reachable|down-hosts|power|agent|member)$/
+            k.find() && !maintIds.contains(k.group(1) as Long) && !(k.group(2) == 'agent' && f.severity != Finding.CRITICAL)
+        } || o.events.any { it.clusterId == cid && (it.meta.rule in ['peer-unreachable', 'failover']) }
+        if (otherLoss) return
+        o.events.removeIf { Finding e ->
+            if (e.clusterId != cid || !FENCE_WINDOW_RULES.contains(e.meta.rule)) return false
+            // the logging host names itself in its own heartbeat lines ("... for host node1, on all heartbeat targets")
+            if (namesHost(e.detail ?: '', w.otherHostNames - [shortName(e.resource)])) return false
+            Long t = e.since?.time
+            recent.values().any { Map m ->
+                m.firstDownMs != null && inPeriod(m, t) && Math.abs(t - (m.firstDownMs as long)) <= AlertState.PEER_LOSS_WINDOW_MS
+            }
+        }
     }
 
     /**
@@ -218,7 +332,7 @@ class AlertCycle {
             maintenanceHosts.any { m -> (m.names as Set).any { sameHost(name, it as String) } || ((m.ips ?: []) as Set).any { ip -> (addresses ?: []).contains(ip) } }
         }
         int unreachable = maintenanceHosts.count { m ->
-            m.off || (m.names as Set).any { mn -> named.any { sameHost(it, mn as String) } } || ((m.ips ?: []) as Set).any { namedIps.contains(it) }
+            m.off || m.down || (m.names as Set).any { mn -> named.any { sameHost(it, mn as String) } } || ((m.ips ?: []) as Set).any { namedIps.contains(it) }
         } as int
         findings.removeIf { Finding f ->
             if (f.clusterId != clusterId || !f.key.startsWith('hc:')) return false
@@ -262,6 +376,8 @@ class AlertCycle {
                     .collect { it.since?.time }
             o.findings.findAll { it.clusterId == cid && it.key ==~ /${java.util.regex.Pattern.quote(p)}(reachable|down-hosts|peer:.*)/ }
                     .each { ownLoss << (state.firstSeen[it.key] ?: nowMs) }
+            // a maintenance host going down is a peer loss at the start of its down episode, not for the whole outage
+            state.maintenanceWindows(cid, nowMs).values().each { Map m -> if (m.firstDownMs != null) ownLoss << (m.firstDownMs as Long) }
             boolean peerLoss = ownLoss.any(inWindow)
             if (peerLoss && !storageDown) {
                 log.info("[hvm-cluster-alert] host ${h.name}: ${cand.count} heartbeat write failures during a peer loss; not an APD")
@@ -339,9 +455,11 @@ class AlertCycle {
                 // (monitoring.rst:116-118 vs 239-241) and needs two cycles, so one late check-in mails nothing
                 o.findings << new Finding(key: "host:${h.id}:agent", severity: crit ? Finding.CRITICAL : Finding.WARNING,
                         clusterId: c.id, cluster: c.name, resource: h.name, title: "Agent silent for ${minutes} min",
-                        detail: "Last agent update ${last.toInstant()}. HPE: > 2 min agent or network issue, > 5 min agent probably down.",
+                        detail: "Last agent update ${last.toInstant()}. HPE: > 2 min agent or network issue, > 5 min agent may be down.",
                         source: 'manager', confirmCycles: crit ? 1 : 2)
-                if (crit) ok = false
+                // a silent agent whose last check already hung is not asked again: each try waits the full timeout and
+                // stretches every cycle until the manager marks the power state unknown (field, host powered off, 2026-11-09)
+                if (crit || state?.hostNoAnswer?.contains(h.id)) ok = false
             }
         }
         return ok
@@ -407,6 +525,9 @@ class AlertCycle {
             Throwable t = (Throwable) result
             log.warn("[hvm-cluster-alert] host ${h.name}: command failed: ${t.class.simpleName}: ${t.message}")
         }
+        boolean noAnswer = result instanceof Throwable && !(result instanceof NotStarted) && !(result instanceof InterruptedException)
+        if (noAnswer) state.hostNoAnswer << h.id
+        else if (tr != null) state.hostNoAnswer.remove(h.id)
         String out = tr?.output ?: (tr?.data instanceof String ? tr.data : null)
         if (tr == null || !out) {
             String why = tr ? (tr.error ?: tr.msg ?: 'no output from the agent') :
