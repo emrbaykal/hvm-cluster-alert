@@ -63,6 +63,11 @@ class ApplianceMailer {
     }
 
     void send(List<String> to, String subject, String html) {
+        sendChecked(to, subject, html)
+    }
+
+    /** As send; returns null when every recipient took the mail, else who got it and who refused it (partial delivery). */
+    String sendChecked(List<String> to, String subject, String html) {
         if (!to) throw new IllegalStateException('no mail recipients configured')
         Map<String, String> s = smtpSettings()
         if (!s.server) throw new IllegalStateException('the appliance has no SMTP server set (Administration > Settings > Email)')
@@ -98,10 +103,12 @@ class ApplianceMailer {
         helper.setText(html, true)
         try {
             sender.send(message)
+            return null
         } catch (Throwable t) {
             String partial = partialDelivery(t)
             if (partial == null) throw t
             log.warn("[hvm-cluster-alert] mail ${partial}: ${subject}")
+            return partial
         }
     }
 

@@ -34,10 +34,35 @@ class TabSettings {
     static final List<String> CHECKBOXES = ['alertEnabled', 'relayNativeAlarms', 'hostChecks', 'dailyStatus']
     /** What a cluster without saved settings shows: HPE's defaults, no recipients. */
     static final Map DEFAULTS = [alertEnabled: true, recipients: [], relayNativeAlarms: true, hostChecks: true, dailyStatus: true,
-                                 agentWarnMinutes: 2, agentCriticalMinutes: 5, nodeUnreachableSeconds: 60, fencingWaitSeconds: 30]
+                                 agentWarnMinutes: 2, agentCriticalMinutes: 5, nodeUnreachableSeconds: 60, fencingWaitSeconds: 30, levels: [:]]
 
     static String key(Long clusterId) {
         KEY_PREFIX + clusterId
+    }
+
+    /** Planned-work mute of one cluster, kept apart from the settings so muting does not change them (no new started mail). */
+    static final String MUTE_PREFIX = 'secret/hvm-cluster-alert/mute-'
+    static final List<Integer> MUTE_HOURS = [1, 2, 4, 8, 24]
+
+    static String muteKey(Long clusterId) {
+        MUTE_PREFIX + clusterId
+    }
+
+    static String muteJson(long untilMs, String user, long nowMs) {
+        JsonOutput.toJson([until: untilMs, by: user ?: 'unknown', at: nowMs])
+    }
+
+    /** [until (ms), by, at] of a stored mute, or null; an expired mute is returned too (the caller compares with now). */
+    static Map parseMute(String json) {
+        if (!json?.trim()) return null
+        try {
+            Object m = new JsonSlurper().parseText(json)
+            if (!(m instanceof Map) || !(((Map) m).until instanceof Number)) return null
+            return [until: ((Number) ((Map) m).until).longValue(), by: ((Map) m).by?.toString() ?: '?',
+                    at: ((Map) m).at instanceof Number ? ((Number) ((Map) m).at).longValue() : null]
+        } catch (Exception ignored) {
+            return null
+        }
     }
 
     /**
@@ -73,6 +98,14 @@ class TabSettings {
                 values[k] = v.toInteger()
             }
         }
+        List<String> badLevels = Checks.ALL*.id.findAll { String id ->
+            String lv = params?.get(Checks.FIELD + id)?.toString()?.trim()?.toLowerCase()
+            lv && !(lv in Checks.LEVELS)
+        }
+        if (badLevels) errors.levels = "Alert level not known for: ${badLevels.join(', ')}.".toString()
+        values.levels = Checks.clean(Checks.ALL*.id.collectEntries { String id ->
+            [(id): params?.get(Checks.FIELD + id)?.toString()?.trim()?.toLowerCase()]
+        })
         if (!errors.agentWarnMinutes && !errors.agentCriticalMinutes && values.agentCriticalMinutes < values.agentWarnMinutes) {
             errors.agentCriticalMinutes = 'Agent silent critical must not be lower than the warning.'
         }
@@ -101,7 +134,9 @@ class TabSettings {
     static AlertSettings.ClusterRule ruleFromJson(Long clusterId, String json, String source) {
         Map m = parse(json)
         if (m == null) return null
-        Map values = m.findAll { k, v -> !(k in ['updatedBy', 'updatedAt', 'templateFrom', 'templateFromName']) }
+        Map values = m.findAll { k, v -> !(k in ['updatedBy', 'updatedAt', 'templateFrom', 'templateFromName', 'levels']) }
+        Map<String, String> levels = Checks.clean(m.levels)
+        if (levels) values.levels = levels      // settings saved before 1.22.0 keep their fingerprint
         new AlertSettings.ClusterRule(clusterId: clusterId, source: source, enabled: m.alertEnabled == true,
                 fingerprint: source.take(1) + Integer.toHexString(new TreeMap(values.collectEntries { k, v -> [(k.toString()): v?.toString()] }).toString().hashCode()),
                 recipients: (m.recipients ?: []).collect { it.toString() },
@@ -109,7 +144,8 @@ class TabSettings {
                 agentWarnMinutes: AlertSettings.toInt(m.agentWarnMinutes?.toString(), 2, NUMBERS.agentWarnMinutes[0]),
                 agentCriticalMinutes: AlertSettings.toInt(m.agentCriticalMinutes?.toString(), 5, NUMBERS.agentCriticalMinutes[0]),
                 nodeUnreachableSeconds: AlertSettings.toInt(m.nodeUnreachableSeconds?.toString(), 60, NUMBERS.nodeUnreachableSeconds[0]),
-                fencingWaitSeconds: AlertSettings.toInt(m.fencingWaitSeconds?.toString(), 30, NUMBERS.fencingWaitSeconds[0]))
+                fencingWaitSeconds: AlertSettings.toInt(m.fencingWaitSeconds?.toString(), 30, NUMBERS.fencingWaitSeconds[0]),
+                levels: Checks.clean(m.levels))
     }
 
     // Cypher access, in the tenant that owns the cluster

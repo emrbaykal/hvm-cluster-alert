@@ -7,7 +7,7 @@ plugins {
 
 group   = 'com.hpe.hvmalert'
 // Bump on every revision so the operator can identify which build is loaded. History: CHANGELOG.md.
-version = '1.21.3'
+version = '1.25.1'
 
 // morpheus-plugin-api is compiled for Java 11; a Java 8 target fails variant matching.
 sourceCompatibility = '11'

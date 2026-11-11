@@ -26,6 +26,10 @@ class AlertSettings {
         int agentCriticalMinutes = 5
         int nodeUnreachableSeconds = 60
         int fencingWaitSeconds = 30
+        Map<String, String> levels = [:]  // check id -> warning | critical | off (Checks); missing = default
+        Long muteUntil                    // alerts muted until (epoch ms), from the tab's Mute (TabSettings.muteKey)
+        String mutedBy
+        Long mutedAt                      // when the mute was set (the "mute ended" mail says since when)
     }
 
     int intervalMinutes = 2                            // fixed: there are no plugin settings

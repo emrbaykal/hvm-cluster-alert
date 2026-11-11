@@ -42,12 +42,18 @@ class HvmClusterTabProvider extends AbstractClusterTabProvider {
             try {
                 f.own = TabSettings.parse(TabSettings.read(morpheus, cluster.owner, TabSettings.key(cluster.id)))
                 f.template = TabSettings.parse(TabSettings.read(morpheus, cluster.owner, TabSettings.TEMPLATE_KEY))
+                f.mute = TabSettings.parseMute(TabSettings.read(morpheus, cluster.owner, TabSettings.muteKey(cluster.id)))
                 f.formToken = FormToken.issue(FormToken.secret(morpheus, cluster.owner, true), cluster.id, System.currentTimeMillis())
             } catch (Throwable t) {
                 f.error = "Settings not readable from Cypher: ${t.class.simpleName}: ${t.message}".toString()
             }
         }
         try { f.open = (plugin as HvmClusterAlertPlugin)?.scheduler?.openFor(cluster.id) } catch (Throwable ignored) { }
+        try {
+            AlertScheduler sch = (plugin as HvmClusterAlertPlugin)?.scheduler
+            f.mail = sch?.mailFor(cluster.id)
+            f.leader = sch?.isLeader() == true
+        } catch (Throwable ignored) { }
         HTMLResponse.success(SettingsPage.render(f))
     }
 }

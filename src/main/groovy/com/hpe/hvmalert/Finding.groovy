@@ -27,6 +27,13 @@ class Finding {
     boolean preStart       // event logged before this monitor started (may have been mailed by the previous one)
     Map meta = [:]         // parser details, e.g. how many nodes are missing
 
+    /** A copy with another severity (an alert level set on the cluster tab); the original stays as the checks saw it. */
+    Finding withSeverity(String s) {
+        new Finding(key: key, severity: s, clusterId: clusterId, cluster: cluster, resource: resource, title: title, detail: detail,
+                source: source, since: since, holdSeconds: holdSeconds, confirmCycles: confirmCycles, preStart: preStart,
+                meta: meta == null ? null : new LinkedHashMap(meta))
+    }
+
     static int rank(String severity) {
         severity == CRITICAL ? 2 : (severity == WARNING ? 1 : 0)
     }

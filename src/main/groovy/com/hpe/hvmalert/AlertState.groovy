@@ -36,6 +36,8 @@ class AlertState {
     static final long MAINT_EPISODE_GAP_MS = 5 * 60000L
     /** A host's maintenance record is forgotten this long after it left maintenance. */
     static final long MAINT_KEEP_MS = 30 * 60000L
+    /** A hold may count from the agent's own time (meta.observedMs) at most this much before the first read. */
+    static final long MAX_OBSERVED_LEAD_MS = 3 * 60000L
 
     static class Diff {
         List<Finding> opened = []
@@ -59,6 +61,8 @@ class AlertState {
         int failures = 0
         long nextAttemptMs = 0
         List<String> recipients = []          // who got the last mail; told once when the cluster stops being watched
+        Long muteAnnounced                    // mute end time the "muted" mail went out for
+        Long mutedSince                       // when that mail went out; set until the "mute ended" mail is sent
     }
 
     Map<String, Finding> active = [:]
@@ -72,6 +76,8 @@ class AlertState {
     Map<Long, Integer> lastGfs2 = [:]       // cluster id -> GFS2 datastores counted last time
     Map<Long, List> logPos = [:]            // host id -> [inode, size] where the agent log was last read
     Map<Long, String> quorumLine = [:]      // host id -> newest agent quorum line seen
+    Map<Long, Long> lastVmOffMs = [:]       // host id -> newest APD "powered off VM" time already reported
+    Map<Long, Map> gfs2Blocked = [:]        // cluster id -> [at (last signal ms), detail] of an open "GFS2 blocked" row
     Set<Long> hostNoAnswer = [] as Set      // hosts whose last check got no answer from the agent within the timeout
     Map<Long, Map> maintenance = [:]        // host id -> [clusterId, names, enteredMs, seenMs (first/last cycle in maintenance), firstDownMs, downMs]
     Map<Long, ClusterMail> mail = [:]       // by cluster id
@@ -94,15 +100,22 @@ class AlertState {
             }
             int n = (seenCount[f.key] ?: 0) + 1
             seenCount[f.key] = n
-            if (f.source != 'native-alarm') f.since = new Date(first)   // native alarms keep their start date
-            boolean held = f.holdSeconds <= 0 || nowMs - first >= f.holdSeconds * 1000L
+            // a hold counts from the agent's own observation when the finding carries one (DLM waiting on a reachable node)
+            long start = first
+            Long observed = f.meta?.observedMs instanceof Number ? ((Number) f.meta.observedMs).longValue() : null
+            if (observed != null && observed < first && first - observed <= MAX_OBSERVED_LEAD_MS) start = observed
+            if (f.source != 'native-alarm') f.since = new Date(start)   // native alarms keep their start date
+            boolean held = f.holdSeconds <= 0 || nowMs - start >= f.holdSeconds * 1000L
             boolean confirmed = f.source == 'native-alarm' || active.containsKey(f.key) || n >= Math.max(1, f.confirmCycles)
             if (held && confirmed) cur[f.key] = f
         }
         // a host whose check could not run neither confirms nor forgets a finding seen once (VME lab T3, 2026-11-08: the
-        // host rebooted itself before the 2nd read and its all-paths-down count was wiped)
+        // host rebooted itself before the 2nd read and its all-paths-down count was wiped). Not the plugin's own check
+        // problems: two failures with a skipped cycle between them are not consecutive (VME lab T3, 2026-11-11: a timeout,
+        // a skipped cycle, then one empty answer after the host's reboot mailed "Host checks could not run")
         Set<String> carriedPending = seenCount.keySet().findAll { String k ->
-            !seen.contains(k) && carryPrefixes.any { k.startsWith(it) } && (firstSeen[k] == null || nowMs - firstSeen[k] <= PENDING_CARRY_MS)
+            !seen.contains(k) && carryPrefixes.any { k.startsWith(it) } && (firstSeen[k] == null || nowMs - firstSeen[k] <= PENDING_CARRY_MS) &&
+                    !(k.startsWith('hc:') && k.split(':').size() == 3 && k.split(':')[2] in Checks.HOST_HEALTH)
         } as Set
         seenCount.keySet().retainAll(seen + carriedPending)
 
@@ -246,6 +259,8 @@ class AlertState {
         logPos.clear()
         quorumLine.clear()
         hostNoAnswer.clear()
+        lastVmOffMs.clear()
+        gfs2Blocked.clear()
         maintenance.clear()
         mail.clear()
     }

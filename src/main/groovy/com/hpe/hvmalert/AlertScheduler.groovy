@@ -33,6 +33,11 @@ class AlertScheduler {
     ApplianceMailer mailer = new ApplianceMailer()
     volatile String lockId
     long nextRunMs = 0
+    /** While DLM may be blocked (fencing), the next check runs after one tick (30 s) instead of the interval, at most
+     *  this many times in a row: the other hosts' agents shut VMs down about 2 min after their heartbeat writes start
+     *  failing (VME lab T5, 2026-11-10). */
+    static final int MAX_FAST_CYCLES = 6
+    int fastCycles = 0
     volatile Date lastCycle
     volatile Map openSnapshot = [:]   // [checkedAt: Date, open: cluster id -> open problems], read by the cluster tab
     Map<String, String> readCache = [:]             // last Cypher values (leader), used when a read fails
@@ -94,6 +99,7 @@ class AlertScheduler {
                 log.info("[hvm-cluster-alert] ${node} lost leadership")
                 state.reset()
                 openSnapshot = [:]
+                mailSnapshot = [:]
             }
             return
         }
@@ -120,10 +126,21 @@ class AlertScheduler {
             lockId = null
             state.reset()
             openSnapshot = [:]
+            mailSnapshot = [:]
             return
         }
         publishOpen(o.clusters.keySet(), lastCycle)
         notifyClusters(s, o, System.currentTimeMillis())
+        publishMail()
+        if (AlertCycle.fencingRisk(o, System.currentTimeMillis(), state.firstSeen)) {
+            if (fastCycles < MAX_FAST_CYCLES) {
+                fastCycles++
+                nextRunMs = now + TICK_SECONDS * 1000L
+                log.info("[hvm-cluster-alert] fencing or heartbeat failures open: next check about ${TICK_SECONDS} s after this one (${fastCycles}/${MAX_FAST_CYCLES})")
+            }
+        } else {
+            fastCycles = 0
+        }
     }
 
     /** The open problems of each watched cluster after this cycle, as one immutable map (web threads read it). */
@@ -132,6 +149,29 @@ class AlertScheduler {
         Map<Long, List<Finding>> snap = [:]
         watched.each { Long id -> snap[id] = Collections.unmodifiableList(new ArrayList<Finding>(by[id] ?: [])) }
         openSnapshot = Collections.unmodifiableMap([checkedAt: checkedAt, open: Collections.unmodifiableMap(snap)])
+    }
+
+    volatile Map<Long, Map> mailSnapshot = [:]   // cluster id -> mail status for the tab (written by the leader after each cycle)
+
+    /** The mail status of each cluster as one immutable map (web threads read it). */
+    void publishMail() {
+        Map<Long, Map> snap = [:]
+        state.mail.each { Long id, AlertState.ClusterMail cm ->
+            snap[id] = Collections.unmodifiableMap([lastOkMs: cm.lastOkMs, lastErrorMs: cm.lastErrorMs, lastError: cm.lastError,
+                                                   nextAttemptMs: cm.nextAttemptMs, failures: cm.failures])
+        }
+        mailSnapshot = Collections.unmodifiableMap(snap)
+    }
+
+    /** True while this node holds the leader lock (it runs the checks and mails). */
+    boolean isLeader() {
+        !stopped && lockId != null
+    }
+
+    /** For the cluster tab: the mail status of this cluster on the leader, or null on another node or before the first cycle. */
+    Map mailFor(Long clusterId) {
+        if (stopped || lockId == null || clusterId == null) return null
+        mailSnapshot.get(clusterId)
     }
 
     /** For the cluster tab: [checkedAt, findings] of the last check of this cluster on this node, or null. */
@@ -177,33 +217,63 @@ class AlertScheduler {
                 cm.cycles = 0
             }
             cm.cycles++
+            // alert levels of the tab apply when a mail is composed, after every check and rule ran with the default
+            // severities (Checks); pending events stay raw so a level changed meanwhile applies to them too
             cm.pendingEvents.addAll(eventsBy[id] ?: [])
+            cm.pendingEvents.removeAll { Checks.isOff(rule.levels, it) }
             if (cm.pendingEvents.size() > AlertState.MAX_PENDING_EVENTS) {
                 cm.pendingEvents = cm.pendingEvents.drop(cm.pendingEvents.size() - AlertState.MAX_PENDING_EVENTS)
             }
             if (now < cm.nextAttemptMs) return
-            List<Finding> open = openBy[id] ?: []
+            List<Finding> open = Checks.applyAll(rule.levels, openBy[id])
+            List<String> off = Checks.offTitles(rule.levels)
+            List<Finding> events = Checks.applyAll(rule.levels, cm.pendingEvents)
             Map m
-            if (cm.announced != rule.fingerprint) {
+            Set<String> shown = null     // keys a change mail showed as NEW or CHANGED; null: the mail lists every open row
+            boolean muted = rule.muteUntil != null && now < rule.muteUntil
+            if (muted) {
+                // planned work (tab "Mute"): one mail per mute end time, then nothing until it ends; events keep collecting
+                if (cm.muteAnnounced == rule.muteUntil) return
+                m = MailComposer.muted(node, name, rule.muteUntil, rule.mutedBy)
+            } else if (cm.mutedSince != null) {
+                // like the started mail, wait until problems could be confirmed after a reload or a settings change
+                if (cm.cycles < AlertState.CONFIRM_CYCLES) return
+                // what changed against what the recipients were told before the mute: cleared and changed rows too
+                AlertState.Diff d = cm.announced == null ? null : AlertState.diff(cm.notified, open)
+                m = MailComposer.muteEnded(open, events, node, name, cm.mutedSince, off, d)
+            } else if (cm.announced != rule.fingerprint) {
                 // a new or changed rule: summarize once problems could be confirmed (CONFIRM_CYCLES cycles)
                 if (cm.cycles < AlertState.CONFIRM_CYCLES) return
-                m = MailComposer.started(open, cm.pendingEvents, node, name)
+                m = MailComposer.started(open, events, node, name, off)
             } else {
                 AlertState.Diff d = AlertState.diff(cm.notified, open)
-                d.events = cm.pendingEvents
+                d.events = events
                 if (!d.isEmpty()) {
-                    m = MailComposer.change(d, node)
+                    m = MailComposer.change(d, node, open)
+                    shown = (d.opened + d.changed)*.key as Set
                 } else if (rule.dailyStatus && cm.lastOkMs != null && now - cm.lastOkMs >= DAY_MS) {
-                    m = MailComposer.daily(open, node, name)
+                    m = MailComposer.daily(open, node, name, off)
                 } else {
                     return
                 }
             }
             String error = deliver(rule.recipients, m)
             logRows(name, m, error)
-            if (error == null) {
+            if (error == null && muted) {
+                cm.muteAnnounced = rule.muteUntil
+                if (cm.mutedSince == null) cm.mutedSince = (rule.mutedAt != null && rule.mutedAt <= now) ? rule.mutedAt : now
+                cm.lastOkMs = now
+                cm.recipients = rule.recipients
+                cm.failures = 0
+                cm.nextAttemptMs = 0
+            } else if (error == null) {
+                cm.mutedSince = null
+                cm.muteAnnounced = null
                 cm.announced = rule.fingerprint
-                cm.notified = open.collectEntries { [(it.key): it] }
+                // a change mail moves only the rows it showed forward, so a later RESOLVED row repeats the text that was
+                // mailed, not a newer one nobody saw (VME lab 2026-11-11: a host status message and peer ages)
+                Map<String, Finding> told = cm.notified
+                cm.notified = open.collectEntries { Finding f -> [(f.key): (shown == null || f.key in shown) ? f : (told[f.key] ?: f)] }
                 cm.pendingEvents = []
                 cm.lastOkMs = now
                 cm.recipients = rule.recipients
@@ -226,7 +296,7 @@ class AlertScheduler {
      */
     void tellStopped(AlertCycle.Outcome o) {
         state.mail.findAll { Long id, AlertState.ClusterMail cm ->
-            !o.clusters.containsKey(id) && cm.announced != null && o.listed.containsKey(id) && cm.recipients
+            !o.clusters.containsKey(id) && (cm.announced != null || cm.muteAnnounced != null) && o.listed.containsKey(id) && cm.recipients
         }.each { Long id, AlertState.ClusterMail cm ->
             if (stopped) return
             String error = deliver(cm.recipients, MailComposer.stopped(node, o.listed[id]))
@@ -242,7 +312,7 @@ class AlertScheduler {
         rows.take(MAX_LOGGED_ROWS).each { List row ->
             Finding f = row[1] as Finding
             log.info("[hvm-cluster-alert] ${cluster} ${error == null ? 'mailed' : 'NOT mailed'}: ${row[0]} ${f.severity} ${f.resource}: " +
-                    "${f.title}${f.detail ? ' - ' + f.detail.take(200) : ''}")
+                    "${f.title}${f.detail ? ' - ' + f.detail.take(600) : ''}")
         }
         if (rows.size() > MAX_LOGGED_ROWS) log.info("[hvm-cluster-alert] ${cluster}: ${rows.size() - MAX_LOGGED_ROWS} more row(s) not logged")
     }

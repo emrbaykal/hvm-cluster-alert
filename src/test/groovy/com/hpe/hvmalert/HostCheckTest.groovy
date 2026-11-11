@@ -239,6 +239,7 @@ class HostCheckTest {
             stub('curl', "echo '[]'")
             stub('stat', 'f="$3"; [ -f "$f" ] || exit 1; printf "%s %s\\n" "$(ls -i "$f" | awk \'{print $1}\')" "$(wc -c < "$f" | tr -d " ")"')
             stub('dlm_tool', 'echo "daemon now 1 fence_pid 0"')
+            stub('cut', 'exit 0')     // no @@UP uptime: the fixed log times must not count as older than this machine's boot
             File logf = new File(dir, 'current.log')
             logf.text = logText
             ProcessBuilder pb = new ProcessBuilder('/bin/sh', '-c', HostCheck.script(null, -1L, 0, logf.absolutePath)).redirectErrorStream(true)
@@ -262,10 +263,12 @@ class HostCheckTest {
                 'ERROR c.m.agent.stats.MvmHeartbeatFailover - Failed to write heartbeat file for host h1, on all heartbeat targets.',
                 'WARN  c.m.a.DlmService - Attempting fence_ack anyway.',
                 'WARN  c.m.agent.stats.MvmHeartbeatFailover - Hosts h2 have failed to update heartbeat in 61000 milliseconds',
-                'WARN  c.m.agent.stats.MvmHeartbeatFailover - Skipping unhealthy heartbeat datastore path /x']
+                'WARN  c.m.agent.stats.MvmHeartbeatFailover - Skipping unhealthy heartbeat datastore path /x',
+                'WARN  c.m.a.services.QuorumCheckService - SELF-FENCING via immediate reboot',
+                'WARN  c.m.a.services.QuorumCheckService - DLM fence_wait: NOT ACKING reachable node h3 (dlmNodeId=3) - no confirmed reboot since partition']
         String text = samples.withIndex().collect { l, i -> "2026-11-04T18:37:${String.format('%02d', i)}.000Z [t] [] ${l}\n" }.join('')
         HostCheck.Result r = runScript(text)
-        assertEquals(['peer-unreachable', 'failover', 'apd', 'quorum-lost', 'hb-all', 'fence-ack', 'hb-late', 'hb-path'] as Set,
+        assertEquals(['peer-unreachable', 'failover', 'apd', 'quorum-lost', 'hb-all', 'fence-ack', 'hb-late', 'hb-path', 'self-fence', 'fence-refused'] as Set,
                 r.events*.rule as Set)
     }
 

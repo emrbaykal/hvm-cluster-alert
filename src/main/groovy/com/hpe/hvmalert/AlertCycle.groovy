@@ -74,6 +74,8 @@ class AlertCycle {
         int expectedGfs2
         List<Map> apdCandidates = []             // consecutive heartbeat-failure runs found this cycle
         Set<String> otherHostNames = [] as Set   // short names of the cluster's hosts not in maintenance
+        Map<String, List<String>> fenceReachable = [:]   // host name -> nodes its fresh quorum line shows awaiting a fence while reachable
+        Set<String> freshQuorum = [] as Set               // hosts that logged a new quorum line since the last read
     }
 
     /**
@@ -114,6 +116,15 @@ class AlertCycle {
                     templates[owner]
                 })
         clusters.each { s.ruleForId(it.id).name = it.name; o.clusters[it.id] = it.name }
+        clusters.each { ComputeServerGroup c ->
+            Map mute = TabSettings.parseMute(readSettings(c, TabSettings.muteKey(c.id)))
+            if (mute != null) {
+                AlertSettings.ClusterRule r = s.ruleForId(c.id)
+                r.muteUntil = mute.until as Long
+                r.mutedBy = mute.by as String
+                r.mutedAt = mute.at as Long
+            }
+        }
 
         List<Work> work = []
         clusters.each { ComputeServerGroup c ->
@@ -219,6 +230,89 @@ class AlertCycle {
         }
         evaluateApd(w, o, nowMs)
         dropMaintenanceEvents(w, o, nowMs)               // after evaluateApd, which reads these events as peer loss
+        gfs2Blocked(w, o, nowMs)
+    }
+
+    static final long BLOCKED_WINDOW_MS = 5 * 60000L
+    static final Set<String> FENCING_RULES = ['hb-all', 'fence-refused', 'dlm-member-lost', 'quorum-lost', 'self-fence'] as Set
+    static final long FENCING_EVENT_AGE_MS = 3 * 60000L
+
+    /** True while this cycle shows DLM possibly blocked: then the scheduler checks again after 30 s. */
+    /** Findings open longer than this no longer drive the fast re-check (a service left stopped on purpose). */
+    static final long FENCING_FINDING_MAX_AGE_MS = 10 * 60000L
+    /** A "GFS2 blocked" row stays open this long after its last signal, unless a fresh quorum line shows it cleared. */
+    static final long BLOCKED_HOLD_MS = 3 * 60000L
+
+    /** True while this cycle shows DLM possibly blocked: then the scheduler checks again after 30 s. */
+    static boolean fencingRisk(Outcome o, long nowMs, Map<String, Long> firstSeen = [:]) {
+        o.findings.any { it.key ==~ /.*:(gfs2-blocked|dlm-wait|dlm-active|corosync-active)$/ &&
+                (firstSeen[it.key] == null || nowMs - firstSeen[it.key] <= FENCING_FINDING_MAX_AGE_MS) } ||
+                o.events.any { it.meta?.rule in FENCING_RULES && !it.preStart && it.since != null && nowMs - it.since.time <= FENCING_EVENT_AGE_MS }
+    }
+
+    /**
+     * One CRITICAL for the cluster when DLM waits on a fence the agents will not give: a node left DLM but is still
+     * reachable, and the agents do not fence a reachable node that has not rebooted (split-brain guard). GFS2 then
+     * blocks on every host, the other hosts' heartbeat writes fail, and at 6 failures in a row (about 2 min) their
+     * agents shut down their non-pinned VMs (VME lab T5, 2026-11-10: corosync stopped on one host; 31 VMs and the
+     * manager VM powered off 106 s after the last mail).
+     * Raised by a new "NOT acking reachable node" line, or by a fresh quorum line with such a node while another host's
+     * heartbeat writes fail on all targets. Left out: hosts in maintenance (they left their lockspaces), lines re-read
+     * after a reload, and a node the same cycle reports lost (peer age, "unreachable, taking action", HA failover,
+     * fence_ack: an ordinary host loss). The row is kept BLOCKED_HOLD_MS after its last signal, so a 30 s re-check
+     * without a new line does not resolve it mid-incident, and ends earlier when a fresh quorum line shows no such node.
+     */
+    void gfs2Blocked(Work w, Outcome o, long nowMs) {
+        Long cid = w.cluster.id
+        Set<String> maint = w.maintenanceHosts.collectMany { (it.names ?: []) as Collection<String> } as Set<String>
+        List<Finding> recent = o.events.findAll { it.clusterId == cid && !it.preStart && it.since != null && nowMs - it.since.time <= BLOCKED_WINDOW_MS }
+        // nodes this cycle reports lost: their fence is the normal one
+        Set<String> lost = o.findings.findAll { it.clusterId == cid }.collect { Finding f ->
+            def m = (f.key ?: '') =~ /^hc:\d+:peer:(.+)$/
+            m.find() ? m.group(1) : null
+        }.findAll { it } as Set<String>
+        List<Finding> lossLines = recent.findAll { it.meta?.rule in ['peer-unreachable', 'failover', 'fence-ack'] }
+        Closure<Boolean> excluded = { String n ->
+            maint.any { sameHost(n, it as String) } || lost.any { sameHost(it, shortName(n)) || sameHost(n, it) } ||
+                    lossLines.any { namesHost(it.detail ?: '', [shortName(n)]) }
+        }
+        // refused fences, by node: a node refused by two or more hosts, or also seen waiting, is the one that left DLM
+        // (in T5 the survivors also refused each other)
+        Map<String, Set<String>> refusedBy = [:].withDefault { [] as Set }
+        recent.findAll { it.meta?.rule == 'fence-refused' }.each { Finding e ->
+            def m = (e.detail ?: '') =~ /(?i)not acking reachable node (\S+)/
+            if (m.find() && !maint.any { sameHost(m.group(1), it as String) }) refusedBy[shortName(m.group(1))] << (e.resource as String)
+        }
+        Set<String> waiting = w.fenceReachable.values().flatten().collect { shortName(it as String) }.findAll { !excluded(it) } as Set<String>
+        Set<String> refused = refusedBy.keySet()
+        Set<String> named = refused.findAll { refusedBy[it].size() >= 2 || waiting.any { n -> sameHost(n, it) || sameHost(it, n) } } as Set<String>
+        Set<String> nodes = (named ?: refused) + waiting
+        List<Finding> hb = recent.findAll { it.meta?.rule == 'hb-all' && !nodes.any { n -> sameHost(n, shortName(it.resource as String)) } }
+        Map held = state.gfs2Blocked[cid]
+        if (refused || (waiting && hb)) {
+            List<String> hbHosts = hb.collect { it.resource as String }.unique().sort()
+            Long firstHb = hb.collect { it.since?.time }.findAll { it != null }.min() as Long
+            String hbText = hbHosts ? "Heartbeat writes are failing on all targets on ${hbHosts.join(', ')}" +
+                    (firstHb ? " since ${MailComposer.utc(firstHb).replace(' UTC', '')} UTC" : '') +
+                    '; at 6 failures in a row (about 2 min) the agents shut down all non-pinned VMs of those hosts.' : ''
+            String detail = "Node(s) ${nodes.sort().join(', ')} left DLM but are still reachable, and the agents do not fence a reachable " +
+                    'node (split-brain guard), so GFS2 I/O waits on every host until that node reboots (its agent usually reboots it ' +
+                    "within about 2 min). ${hbText}".toString().trim()
+            held = [at: nowMs, detail: detail]
+            state.gfs2Blocked[cid] = held
+        } else if (held != null) {
+            // a fresh quorum line from a host of the cluster without such a node, or the hold time passed: over
+            boolean cleared = w.freshQuorum && !w.fenceReachable
+            if (cleared || nowMs - (held.at as long) > BLOCKED_HOLD_MS) {
+                state.gfs2Blocked.remove(cid)
+                return
+            }
+        } else {
+            return
+        }
+        o.findings << new Finding(key: "cluster:${cid}:gfs2-blocked", severity: Finding.CRITICAL, clusterId: cid, cluster: w.cluster.name,
+                resource: w.cluster.name, title: 'GFS2 blocked on the cluster: DLM waits on a fence for a node that is still reachable',
+                detail: held.detail as String, source: 'host', confirmCycles: 1)
     }
 
     static final String MAINT_RULE_TITLE = 'Host in maintenance not reachable'
@@ -402,7 +496,9 @@ class AlertCycle {
                     clusterId: cid, cluster: w.cluster.name, resource: h.name,
                     title: storageDown ? 'APD likely: heartbeat writes failing and storage paths down' : 'Possible APD',
                     detail: "${cand.count} consecutive heartbeat write failures on all heartbeat targets${peerLoss ? '' : ' with no peer loss reported by this host'}. ".toString() +
-                            "HPE: the host destroys its non-pinned VMs at ${limit} consecutive failures. Derived from the agent log; unverified rule.",
+                            "HPE documents a shutdown of the non-pinned VMs at ${limit} consecutive failures; in the lab tests (agent 3.3.0) the agent " +
+                            'shut VMs down only when its network heartbeat also failed. The agent\'s own APD line, when logged, says what it did. ' +
+                            'Derived from the agent log; unverified rule.',
                     source: 'event', since: new Date(last), preStart: cand.preStart == true, meta: [rule: 'apd-derived'])
         }
     }
@@ -428,16 +524,22 @@ class AlertCycle {
         boolean ok = true
         String power = h.powerState?.toString()
         if (power != 'on') {
+            // the manager also sets unknown when it loses the agent of a host that still runs (VME lab T1, 2026-11-10: about
+            // 3.5 min after the last agent update, host and VMs up, both peers still reaching it)
+            String detail = 'HPE: off or unknown requires investigation.' + (power == 'off' ? '' :
+                    ' The manager also shows unknown when it gets no agent updates from a host that still runs: if no other host reports it unreachable, suspect the agent or its link to the manager.')
             o.findings << new Finding(key: "host:${h.id}:power", severity: Finding.CRITICAL, clusterId: c.id, cluster: c.name, resource: h.name,
-                    title: "Host power state ${power ?: 'unknown'}", detail: 'HPE: off or unknown requires investigation.', source: 'manager')
+                    title: "Host power state ${power ?: 'unknown'}", detail: detail, source: 'manager')
             ok = false
         }
         String st = h.status?.toLowerCase()
         if (st in ['warning', 'error', 'failed']) {
             // the manager's own view; it still works when the host's agent hangs (storage-partition test: "Error loading
             // hypervisor storage pools: Timed out" while the agent no longer answered commands, VME lab 2026-11-07)
-            o.findings << new Finding(key: "host:${h.id}:status", severity: st == 'warning' ? Finding.WARNING : Finding.CRITICAL,
-                    clusterId: c.id, cluster: c.name, resource: h.name, title: "Host status ${st}",
+            // the manager reports a fenced host as status warning "Host has been fenced (nodedown)" (VME lab T3, 2026-11-11)
+            boolean fenced = ((h.statusMessage ?: '') =~ /(?i)\bfenced\b/).find()
+            o.findings << new Finding(key: "host:${h.id}:status", severity: st == 'warning' && !fenced ? Finding.WARNING : Finding.CRITICAL,
+                    clusterId: c.id, cluster: c.name, resource: h.name, title: fenced ? 'Host fenced (manager host status)' : "Host status ${st}",
                     detail: (h.statusMessage ?: '').take(300), source: 'manager')
         }
         ComputeServer.ServerGroupMemberStatus member = h.serverGroupMemberStatus
@@ -554,6 +656,8 @@ class AlertCycle {
         if (firstRead) log.info("[hvm-cluster-alert] host ${h.name}: host checks run as ${r.privilege}")
         if (r.complete && r.logInode != null) state.logPos[h.id] = [r.logInode, r.logSize]
         if (r.quorumLine) state.quorumLine[h.id] = r.quorumLine
+        if (r.fenceReachable) w.fenceReachable[h.name as String] = r.fenceReachable
+        if (r.quorumLine) w.freshQuorum << (h.name as String)
         o.findings.addAll(r.findings)
         if (!r.complete) o.carry << prefix
         state.newEvents(prefix, r.events, r.hostNow).each { Map e ->
@@ -562,16 +666,35 @@ class AlertCycle {
                     preStart: e.preStart == true, meta: [rule: e.rule])
         }
         long hostNow = HostCheck.parseTime(r.hostNow) ?: System.currentTimeMillis()
+        vmOffEvent(c, h, r, hostNow, firstRead, o)
         List<Long> failures = r.heartbeatFailureTimes.collect { HostCheck.parseTime(it) }.findAll { it != null && it >= hostNow - AlertState.EVENT_LOOKBACK_MS }
         List<Long> run = state.heartbeatRun(h.id, failures)
         if (run) w.apdCandidates << [host: h, count: run[0], first: run[1], last: run[2], stretch: r.stretch, preStart: firstRead]
+    }
+
+    /** One event per host and cycle with the number of VMs the agent's APD shutdown powered off (MvmHeartbeatFailover lines). */
+    void vmOffEvent(ComputeServerGroup c, ComputeServer h, HostCheck.Result r, long hostNow, boolean firstRead, Outcome o) {
+        Long seen = state.lastVmOffMs[h.id]
+        List<Long> offs = r.vmOffTimes.collect { HostCheck.parseTime(it) }
+                .findAll { it != null && it >= hostNow - AlertState.EVENT_LOOKBACK_MS && (seen == null || it > seen) }.sort()
+        if (!offs) return
+        state.lastVmOffMs[h.id] = offs.last()
+        String span = offs.size() == 1 ? MailComposer.utc(offs[0]) :
+                "${MailComposer.utc(offs[0])} - ${MailComposer.utc(offs.last()).replaceFirst(/^\S+ /, '')}"
+        o.events << new Finding(key: "event:${h.id}:vmoff:${offs.last()}", severity: Finding.CRITICAL, clusterId: c.id, cluster: c.name,
+                resource: h.name, title: "APD: the agent powered off ${offs.size()} VM(s) on this host".toString(),
+                detail: "\"Successfully powered off VM\" lines of the agent's APD shutdown (MvmHeartbeatFailover), ${span}.".toString(),
+                source: 'event', since: new Date(offs[0]), preStart: firstRead, meta: [rule: 'apd-vm-off'])
     }
 
     void datastoreChecks(ComputeServerGroup c, Datastore d, Outcome o) {
         String status = d.status?.toLowerCase()
         Map base = [key: "ds:${d.id}:state".toString(), clusterId: c.id, cluster: c.name, resource: d.name, source: 'manager']
         if (d.online == false) {
-            o.findings << new Finding(base + [severity: Finding.CRITICAL, title: 'Datastore offline',
+            // the title names the state the manager shows: in the VME lab (2026-11-11) a datastore still mounted on the
+            // other hosts was "online=false, status warning: Check host(s) vmenode03 status"
+            String shown = status && !(status in ['offline', 'online']) ? "Datastore not online: ${d.status}" : 'Datastore offline'
+            o.findings << new Finding(base + [severity: Finding.CRITICAL, title: shown.toString(),
                     detail: "status ${d.status}${d.statusMessage ? ': ' + d.statusMessage : ''}".toString()])
         } else if (status in ['failed', 'error', 'offline']) {
             o.findings << new Finding(base + [severity: Finding.CRITICAL, title: "Datastore ${status}".toString(), detail: d.statusMessage ?: ''])

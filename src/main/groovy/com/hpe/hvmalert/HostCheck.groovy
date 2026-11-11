@@ -49,7 +49,22 @@ class HostCheck {
          title: 'Host is rebooting itself to rejoin the cluster (DLM lockspace membership lost)'],
         [id: 'dlm-member-lost', re: ~/(?i)DLM lockspace membership lost/, sev: Finding.WARNING,
          title: 'DLM lockspace membership lost (the agent reboots the host at the 2nd confirmation)'],
-        [id: 'quorum-lost', re: ~/(?i)quorum lost/, sev: Finding.CRITICAL, title: 'Quorum lost message'],
+        // Agent 3.3.0, VME lab peer isolation 2026-11-11: two quorum checks without quorum and the agent fences its host
+        // ("Fencing myself from cluster due to loss of quorum (2 consecutive cycles)", "Self-fencing via immediate reboot").
+        // Before quorum-lost, so the mail names the reboot.
+        [id: 'self-fence', re: ~/(?i)fencing myself from cluster|self-fencing via immediate reboot/, sev: Finding.CRITICAL,
+         title: 'Host is fencing itself: quorum lost, immediate reboot'],
+        // Same test: "Quorum Not Achieved: 1 of 3 nodes reachable (need 2)" and "Quorum loss confirmation 1/2 - deferring
+        // self-fence one cycle ...", the only notice (~60 s) before the self-fence. "agent quorum not achieved - not ready"
+        // (FilesystemMountService, every boot) has no count after it and does not match.
+        [id: 'quorum-lost', re: ~/(?i)quorum lost|quorum not achieved: \d+ of|quorum loss confirmation/, sev: Finding.CRITICAL,
+         title: 'Quorum not achieved or lost (agent log; the agent fences its host at the 2nd confirmation)'],
+        // T5 of the same campaign (corosync stopped on one host): DLM on the other hosts waits on a fence the agents refuse
+        // for a node that is reachable and has not rebooted ("DLM fence_wait: NOT acking reachable node X (dlmNodeId=n) - no
+        // confirmed reboot since partition; ... (split-brain guard)"). GFS2 stayed blocked on every host until that node
+        // rebooted; 100 s later both other hosts shut their VMs down at the heartbeat budget.
+        [id: 'fence-refused', re: ~/(?i)not acking reachable node/, sev: Finding.CRITICAL,
+         title: 'DLM fence refused for a reachable node that has not rebooted (split-brain guard): GFS2 stays blocked until it reboots'],
         // The agent's own APD text (agent 3.3.0, layout 1.3, VME lab storage-partition tests 2026-11-07/08): at the 6th
         // failed check "All heartbeat datastore paths have been unhealthy for host X for 6 checks (budget 6). However,
         // network heartbeat is still responsive. leaving VMs alone for now."; from the 7th check "... for 7 checks
@@ -59,10 +74,16 @@ class HostCheck {
         [id: 'apd-budget', re: ~/(?i)all heartbeat datastore paths have been unhealthy/, sev: Finding.CRITICAL,
          title: 'APD: all heartbeat datastore paths unhealthy (agent budget reached, VMs left running for now)'],
         [id: 'hb-all', re: ~/(?i)on all heartbeat targets/, sev: Finding.WARNING,
-         title: 'Heartbeat write failed on all heartbeat targets (expected for up to ~2 min while DLM waits on fencing after a host loss; APD after 6 in a row)'],
+         title: 'Heartbeat write failed on all heartbeat targets (normal for a short time while DLM waits on a fence; 6 in a row, about 2 min, and the agent can shut down the non-pinned VMs of this host)'],
         [id: 'fence-ack', re: ~/(?i)fence_ack/, sev: Finding.WARNING, title: 'DLM fence_ack attempted for a lost node'],
         [id: 'hb-late', re: ~/(?i)failed to update heartbeat in/, sev: Finding.WARNING, title: 'Host heartbeat not updated'],
         [id: 'hb-path', re: ~/(?i)skipping unhealthy heartbeat datastore path/, sev: Finding.WARNING, title: 'Unhealthy heartbeat datastore path skipped'],
+        // The agent's APD shutdown failing for a VM (agent 3.3.0, VME lab peer isolation 2026-11-11: "ERROR
+        // c.m.agent.stats.MvmHeartbeatFailover - Error destroying VM <uuid> - Exit Code: 123"): that VM keeps running
+        // without its storage lease. Only the local form: a surviving host logs "Error destroying VM <uuid> on remote host
+        // <ip> - Exit Code: 255 ssh: ... No route to host" in an ordinary failover (T4 and T3 of the same campaign).
+        [id: 'apd-vm-error', re: ~/(?i)MvmHeartbeatFailover.*error destroying vm [0-9a-f-]+ - exit code/, sev: Finding.CRITICAL,
+         title: 'APD: the agent could not power off a VM'],
         // HPE's own phrases only (vm_migration.rst:217-218, monitoring.rst:233,282, troubleshooting.rst:249): a host or
         // VM name such as "hv-apd" can never form them. Last, so heartbeat lines naming such a host stay warnings.
         [id: 'apd', re: ~/(?i)MvmHeartbeatFailover.*(?:all paths down|\bAPD (?:protection|threshold|activated|triggered|mode)\b|isolation (?:failure|counter|threshold|detected))/,
@@ -71,13 +92,17 @@ class HostCheck {
     /** Shell pre-filter (grep -i, awk tolower); kept in step with EVENT_RULES by a unit test. The DLM-membership 1/2
      *  line is a WARNING rule but goes through the critical ring on purpose: it is the only notice (~60 s) before the
      *  agent reboots the host, and repeated warnings must not push it out. */
-    static final String CRITICAL_GREP = 'is unreachable, taking action|is offline, moving vms|rebooting to cleanly rejoin cluster|recovering self node via reboot|dlm lockspace membership lost|quorum lost|all heartbeat datastore paths have been unhealthy|MvmHeartbeatFailover.*(all paths down|apd (protection|threshold|activated|triggered|mode)|isolation (failure|counter|threshold|detected))'
+    static final String CRITICAL_GREP = 'is unreachable, taking action|is offline, moving vms|rebooting to cleanly rejoin cluster|recovering self node via reboot|dlm lockspace membership lost|fencing myself from cluster|self-fencing via immediate reboot|quorum lost|quorum not achieved: [0-9]+ of|quorum loss confirmation|not acking reachable node|all heartbeat datastore paths have been unhealthy|MvmHeartbeatFailover.*error destroying vm [0-9a-f-]+ - exit code|MvmHeartbeatFailover.*(all paths down|apd (protection|threshold|activated|triggered|mode)|isolation (failure|counter|threshold|detected))'
     static final String WARNING_GREP = 'on all heartbeat targets|fence_ack|failed to update heartbeat in|skipping unhealthy heartbeat datastore path'
 
     /** Lines kept per cycle: repeated warnings can never push a critical line out. */
     static final int MAX_CRITICAL_EVENTS = 40
     static final int MAX_WARNING_EVENTS = 20
     static final int MAX_HEARTBEAT_TIMES = 60
+    /** The agent's APD shutdown logs one "Successfully powered off VM" line per VM (MvmHeartbeatFailover); only the
+     *  times are kept, in a ring of their own, so a host with many VMs cannot push other lines out. */
+    static final String VM_OFF_GREP = 'MvmHeartbeatFailover.*successfully powered off vm'
+    static final int MAX_VM_OFF_TIMES = 500
     /** The quorum line with 16 hosts and 50 lockspaces is about 7.5 KB (16 hosts: HPE a00157488enw). */
     static final int MAX_QUORUM_LINE = 20000
 
@@ -103,6 +128,7 @@ if command -v flock >/dev/null 2>&1 && ( : >>"$LK" ) 2>/dev/null; then
   if ! flock -n 9; then echo "@@BUSY"; echo "@@END"; exit 0; fi
 fi
 echo "@@ID $(id -u) $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "@@UP $(cut -d' ' -f1 /proc/uptime 2>/dev/null)"
 echo "@@PRIV $M"
 G=$($TO findmnt -rn -t gfs2 -o TARGET 2>/dev/null | wc -l)
 echo "@@GFS2MOUNTS $G"
@@ -118,11 +144,12 @@ if [ -n "$CS" ]; then
   elif [ -n "$LI" ]; then F=@MAX_READ@
   else F=@FIRST_READ@; fi
   echo '@@LOGDATA'
-  R tail -c "$F" "$L" 2>/dev/null | tail -c @MAX_READ@ | grep -a -i -E 'quorumAchieved=|@CRIT@|@WARN@' | sed 's/\\x1b\\[[0-9;]*m//g' | awk -v CR='@CRIT@' '
+  R tail -c "$F" "$L" 2>/dev/null | tail -c @MAX_READ@ | grep -a -i -E 'quorumAchieved=|@CRIT@|@WARN@|@VMOFF@' | sed 's/\\x1b\\[[0-9;]*m//g' | awk -v CR='@CRIT@' '
     BEGIN { CR = tolower(CR) }
     !/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ { next }
     /quorumAchieved=/ { q = $0; next }
     { l = tolower($0) }
+    l ~ /mvmheartbeatfailover.*successfully powered off vm/ { p[np % @MAXP@] = $1; np++; next }
     l ~ /on all heartbeat targets/ { h[nh % @MAXH@] = $1; nh++ }
     l ~ CR && l !~ /on all heartbeat targets|failed to update heartbeat in/ { c[nc % @MAXC@] = $0; nc++; next }
     { w[nw % @MAXW@] = $0; nw++ }
@@ -136,6 +163,7 @@ if [ -n "$CS" ]; then
       for (i = (nc > @MAXC@ ? nc - @MAXC@ : 0); i < nc; i++) print "E " substr(c[i % @MAXC@], 1, 400)
       for (i = (nw > @MAXW@ ? nw - @MAXW@ : 0); i < nw; i++) print "E " substr(w[i % @MAXW@], 1, 400)
       for (i = (nh > @MAXH@ ? nh - @MAXH@ : 0); i < nh; i++) print "H " h[i % @MAXH@]
+      for (i = (np > @MAXP@ ? np - @MAXP@ : 0); i < np; i++) print "P " p[i % @MAXP@]
     }'
 fi
 if [ "$G" -gt 0 ] || [ "$E" -gt 0 ]; then
@@ -168,6 +196,8 @@ echo '@@END'
                 .replace('@MAXC@', MAX_CRITICAL_EVENTS.toString())
                 .replace('@MAXW@', MAX_WARNING_EVENTS.toString())
                 .replace('@MAXH@', MAX_HEARTBEAT_TIMES.toString())
+                .replace('@VMOFF@', VM_OFF_GREP)
+                .replace('@MAXP@', MAX_VM_OFF_TIMES.toString())
                 .replace('@MAXQ@', MAX_QUORUM_LINE.toString())
                 .replace('@FIRST_READ@', FIRST_READ_BYTES.toString())
                 .replace('@MAX_READ@', MAX_READ_BYTES.toString())
@@ -184,6 +214,8 @@ echo '@@END'
         Long logSize
         String quorumLine             // newest agent quorum line read this cycle (null: none in the new bytes)
         List<String> heartbeatFailureTimes = []   // "on all heartbeat targets" times read this cycle
+        List<String> vmOffTimes = []              // the agent's APD "Successfully powered off VM" times read this cycle
+        List<String> fenceReachable = []          // nodes the fresh quorum line shows waiting on a fence while reachable
         boolean stretch               // the agent quorum map lists sites (stretch cluster): APD limit 9
         List<Finding> findings = []
         List<Map> events = []         // [ts, severity, title, line, rule], oldest first
@@ -258,10 +290,23 @@ echo '@@END'
             r.logInode = logPos[0]
             r.logSize = logPos[1] as Long
         }
+        // host uptime (@@UP, seconds; absent from older output): a quorum line from before the host's last boot describes
+        // the previous boot and is ignored, whether read now or kept from an earlier cycle (VME lab 2026-11-11: a minority
+        // line from before a self-fence kept "Quorum lost" open for 4 min after the host was back)
+        String up = (s['UP'] ?: [''])[0]?.trim()
+        Double uptimeS = up?.isBigDecimal() ? up.toDouble() : null
+        Long bootMs = uptimeS != null ? nowMs - Math.round(uptimeS * 1000d) : null
+        Closure<String> sameBoot = { String l ->
+            Long t = l ? parseTime(l.trim().split(/\s+/)[0]) : null
+            (bootMs != null && t != null && t < bootMs) ? null : l
+        }
         List<String> data = s['LOGDATA'] ?: []
-        r.quorumLine = data.find { it.startsWith('Q ') }?.substring(2)
+        r.quorumLine = sameBoot(data.find { it.startsWith('Q ') }?.substring(2))
         r.heartbeatFailureTimes = data.findAll { it.startsWith('H ') }.collect { it.substring(2).trim() }.findAll { parseTime(it) != null }
-        String ql = r.quorumLine ?: (ctx.lastQuorumLine as String)
+        r.vmOffTimes = data.findAll { it.startsWith('P ') }.collect { it.substring(2).trim() }.findAll { parseTime(it) != null }
+        if (r.quorumLine) r.fenceReachable = fenceWaitReachable(r.quorumLine)
+        String lastQuorum = sameBoot(ctx.lastQuorumLine as String)
+        String ql = r.quorumLine ?: lastQuorum
         r.stretch = ql != null && (ql =~ /\bsites=\[[^\]\s]/).find()
 
         int unreachable = (ctx.nodeUnreachableSeconds ?: 60) as int
@@ -269,10 +314,12 @@ echo '@@END'
         if (r.clustered) {
             boolean nodeList = parseQuorumApi(s['QUORUM_API'] ?: [], nowMs, unreachable, fencing, add)
             if (r.privilege != 'none' && r.complete) {
-                String q = r.quorumLine ?: (ctx.lastQuorumLine as String)
+                String q = r.quorumLine ?: lastQuorum
+                // the agent's first quorum line after a boot came about 2-2.5 min after it (VME lab 2026-11-11)
+                boolean justBooted = uptimeS != null && uptimeS * 1000d < AGENT_QUORUM_MAX_AGE_MS
                 // with a /quorum node list the peer ages (pinged every 20 s) already report a lost host; the map's
                 // reachable/down-hosts counts lag ~2-4 min and doubled every host loss (VME lab T2/T3, 2026-11-08)
-                if (!parseAgentQuorum(q, nowMs, fencing, add, nodeList, r.quorumLine != null)) {
+                if (!parseAgentQuorum(q, nowMs, fencing, add, nodeList, r.quorumLine != null) && !justBooted) {
                     add('quorum-unknown', Finding.WARNING, 'Agent quorum state unknown',
                             "No agent quorum line newer than ${AGENT_QUORUM_MAX_AGE_MS.intdiv(60000L)} min in ${AGENT_LOG}; quorum cannot be confirmed.")
                 }
@@ -383,10 +430,26 @@ echo '@@END'
         if (val('quorumAchieved') == 'false' && (fresh || !allReached)) {
             add('quorum', Finding.CRITICAL, 'Quorum lost', 'Agent reports quorumAchieved=false.', [confirm: allReached ? 2 : 1])
         }
+        // agent 3.3.0 left quorumAchieved=true with 1 of 3 nodes reachable while its own check logged "Quorum Not Achieved:
+        // 1 of 3 nodes reachable (need 2)" and fenced the host (VME lab peer isolation, 2026-11-11). Only where a plain
+        // majority is the rule: three nodes or more, no witness, no sites (stretch arbitration differs). A kept line counts
+        // too (same boot only, see @@UP): the agent writes a quorum line about every 2 min and the fast re-check runs every
+        // 30 s, so requiring a newly read line would resolve and reopen the row while the host is still in the minority
+        boolean majorityRule = total?.isInteger() && (total as int) >= 3 && !line.contains('witnessOnly=true') &&
+                !(line =~ /\bsites=\[[^\]\s]|\bsite=(?!null\b)[A-Za-z0-9]/).find()
+        if (val('quorumAchieved') == 'true' && majorityRule && reach?.isInteger() && (reach as int) * 2 <= (total as int)) {
+            add('quorum', Finding.CRITICAL, 'Quorum lost',
+                    "The agent shows only ${reach} of ${total} nodes reachable (a majority needs ${(total as int).intdiv(2) + 1}): this host is in the minority. " +
+                    'If quorum is still lost at its next quorum check, about 1 min after its first "Quorum Not Achieved" line, its agent ' +
+                    'fences the host with an immediate reboot (agent 3.3.0).',
+                    [confirm: 1])
+        }
         if (val('fenced') == 'true') add('fenced', Finding.CRITICAL, 'Host is fenced', 'Agent reports fenced=true.', [confirm: 1])
         if (val('waitFencing') == 'true') add('dlm-wait', Finding.CRITICAL, 'DLM waiting on fencing', 'Agent reports waitFencing=true.', [hold: fencingSeconds, confirm: 1])
-        if (val('dlmActive') == 'false') add('dlm-active', Finding.CRITICAL, 'DLM not active', 'Agent reports dlmActive=false.')
-        if (val('corosyncActive') == 'false') add('corosync-active', Finding.CRITICAL, 'Corosync service not active', 'Agent reports corosyncActive=false; DLM depends on it.')
+        // a stopped service is a systemd state, not a transient read; one check, because the agent reboots the host about
+        // 75 s after DLM leaves (VME lab T5, 2026-11-10: seen once at 13:56:22, host rebooting itself at 13:57:36)
+        if (val('dlmActive') == 'false') add('dlm-active', Finding.CRITICAL, 'DLM not active', 'Agent reports dlmActive=false.', [confirm: 1])
+        if (val('corosyncActive') == 'false') add('corosync-active', Finding.CRITICAL, 'Corosync service not active', 'Agent reports corosyncActive=false; DLM depends on it.', [confirm: 1])
         if (!skipHostCounts && reach?.isInteger() && total?.isInteger() && (reach as int) < (total as int)) {
             add('reachable', Finding.CRITICAL, "Only ${reach} of ${total} nodes reachable", 'Agent quorum state.',
                     [confirm: 1, meta: [missing: (total as int) - (reach as int)]])
@@ -398,9 +461,36 @@ echo '@@END'
                     [confirm: 1, meta: [hosts: hosts]])
         }
         if (line.contains('needFencing=true')) {
-            add('dlm-wait', Finding.CRITICAL, 'DLM node needs fencing', 'Agent reports needFencing=true for a node.', [hold: fencingSeconds, confirm: 1])
+            List<String> reachableWait = fenceWaitReachable(line)
+            if (reachableWait && fresh) {
+                // a node that left DLM but is still reachable is not fenced by the agents (split-brain guard) and GFS2
+                // waits on every host until it reboots (VME lab T5, 2026-11-10): the fencing wait counts from the time
+                // the agent logged it, not from when this plugin first read it (up to one interval later)
+                add('dlm-wait', Finding.CRITICAL, 'DLM waits on fencing a node that is still reachable',
+                        "Agent reports needFencing=true for ${reachableWait.join(', ')} while it is reachable; the agents do not fence a " +
+                        'reachable node, so GFS2 I/O waits until it reboots.', [hold: fencingSeconds, confirm: 1, meta: [observedMs: ts]])
+            } else {
+                add('dlm-wait', Finding.CRITICAL, 'DLM node needs fencing', 'Agent reports needFencing=true for a node.', [hold: fencingSeconds, confirm: 1])
+            }
         }
         return true
+    }
+
+    /**
+     * Nodes of an agent quorum line that DLM wants fenced while they are still reachable (not this host), e.g.
+     * {hostname=node3-3, addresses=[..], me=false, lastReachedDate=.., reachable=true, down=false, dlm={nodeId=3,
+     * member=false, needFencing=true, leftReason=procdown}} (agent 3.3.0, VME lab T5, 2026-11-10).
+     */
+    static List<String> fenceWaitReachable(String line) {
+        if (!line) return []
+        int start = line.indexOf('nodes=[')
+        if (start < 0) return []
+        List<String> out = []
+        line.substring(start).split(/\{hostname=/).drop(1).each { String n ->
+            String name = n.split(/[,}]/)[0].trim()
+            if (name && n =~ /\breachable=true\b/ && n =~ /\bneedFencing=true\b/ && !(n =~ /\bme=true\b/)) out << name
+        }
+        out.unique()
     }
 
     static void parseDlm(List<String> lines, int holdSeconds, Closure add) {
