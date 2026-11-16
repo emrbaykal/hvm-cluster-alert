@@ -13,10 +13,10 @@ class OpenProblemsTabTest {
     }
 
     @Test
-    void openProblemsSortedAndAcknowledgedMarked() {
+    void openProblemsSorted() {
         List<Finding> open = Collections.unmodifiableList([
                 new Finding(key: 'alarm:1', severity: Finding.WARNING, resource: 'ds01', title: 'Datastore warning', source: 'native-alarm',
-                        since: new Date(1000L), meta: [acknowledged: true]),
+                        since: new Date(1000L)),
                 new Finding(key: 'hc:3:gfs2', severity: Finding.CRITICAL, resource: 'vmenode03', title: 'GFS2 <withdrawn>', source: 'host',
                         since: new Date(2000L))])
         String html = SettingsPage.render([clusterId: 1L, clusterName: 'c', url: '/u', own: own(),
@@ -24,7 +24,7 @@ class OpenProblemsTabTest {
         assertTrue(html.contains('<h5>Open problems</h5>'))
         assertTrue(html.contains('2 open. Last check: 1970-01-01 00:01 UTC.'))
         assertTrue('critical first', html.indexOf('vmenode03') < html.indexOf('ds01'))
-        assertTrue(html.contains('Datastore warning <span class="text-muted">(acknowledged)</span>'))
+        assertFalse(html.contains('(acknowledged)'))
         assertTrue(html.contains('GFS2 &lt;withdrawn&gt;'))
         assertTrue('mail look: green header', html.contains('background:#01a982;color:#fff'))
         assertTrue('bold red state for a critical', html.contains('color:#c62828;font-weight:bold">OPEN</td>'))

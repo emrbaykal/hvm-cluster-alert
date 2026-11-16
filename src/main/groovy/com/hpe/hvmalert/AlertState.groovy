@@ -81,6 +81,7 @@ class AlertState {
     Set<Long> hostNoAnswer = [] as Set      // hosts whose last check got no answer from the agent within the timeout
     Map<Long, Map> maintenance = [:]        // host id -> [clusterId, names, enteredMs, seenMs (first/last cycle in maintenance), firstDownMs, downMs]
     Map<Long, ClusterMail> mail = [:]       // by cluster id
+    Set<String> acknowledged = [] as Set    // keys of the HVM alarms acknowledged in VME at the last alarm read
 
     /**
      * @param current findings of this cycle
@@ -144,7 +145,8 @@ class AlertState {
     }
 
     /** What changed between what the recipients were told and the current open problems of one cluster. */
-    static Diff diff(Map<String, Finding> notified, Collection<Finding> open) {
+    /** @param acknowledged alarm keys acknowledged in VME: such a row leaves the list and resolves once, marked */
+    static Diff diff(Map<String, Finding> notified, Collection<Finding> open, Set<String> acknowledged = null) {
         Diff d = new Diff()
         Map<String, Finding> now = open.collectEntries { [(it.key): it] }
         now.each { String k, Finding f ->
@@ -152,7 +154,14 @@ class AlertState {
             if (prev == null) d.opened << f
             else if (prev.severity != f.severity) d.changed << f
         }
-        notified.each { String k, Finding f -> if (!now.containsKey(k)) d.resolved << f }
+        notified.each { String k, Finding f ->
+            if (now.containsKey(k)) return
+            if (acknowledged?.contains(k)) {
+                f = f.withSeverity(f.severity)
+                f.title = "${f.title} (acknowledged in VME)".toString()
+            }
+            d.resolved << f
+        }
         return d
     }
 
@@ -248,6 +257,7 @@ class AlertState {
 
     void reset() {
         active.clear()
+        acknowledged.clear()
         firstSeen.clear()
         seenCount.clear()
         missCount.clear()

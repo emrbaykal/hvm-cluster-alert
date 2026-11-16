@@ -162,7 +162,7 @@ class SettingsPage {
         sb.toString()
     }
 
-    /** The confirmed open problems of the last check; an alarm acknowledged in VME stays listed, marked, until it clears. */
+    /** The confirmed open problems of the last check; an alarm acknowledged in VME is not listed. */
     static String openProblems(Map open, Map<String, String> levels = [:]) {
         StringBuilder sb = new StringBuilder('<h5>Open problems</h5>')
         if (open == null) {
@@ -183,8 +183,7 @@ class SettingsPage {
         sb << '</tr></thead><tbody>'
         list.each { Finding p ->
             String color = p.severity == Finding.CRITICAL ? '#c62828' : '#ef6c00'
-            String ack = (p.meta?.acknowledged == true ? ' <span class="text-muted">(acknowledged)</span>' : '') +
-                    (Checks.isOff(levels, p) ? ' <span class="text-muted">(Off: not mailed)</span>' : '')
+            String ack = Checks.isOff(levels, p) ? ' <span class="text-muted">(Off: not mailed)</span>' : ''
             sb << '<tr style="border-bottom:1px solid #ddd">' +
                   "<td style=\"${cell};color:${color};font-weight:bold\">OPEN</td><td style=\"${cell}\">${esc(p.severity)}</td>" +
                   "<td style=\"${cell}\">${esc(p.resource)}</td><td style=\"${cell}\">${esc(p.title)}${ack}</td>" +

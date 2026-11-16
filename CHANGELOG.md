@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.25.2
+
+- **Acknowledged HVM alarms leave the list.** An HVM alarm acknowledged in VME is no longer kept open until it clears.
+  It leaves the tab's open problems and the daily mail at the next check. If it was already mailed, the next mail
+  lists it once as RESOLVED, marked "(acknowledged in VME)". Before, acknowledged alarms stayed listed and came back
+  in every daily mail.
+
 ## 1.25.1
 
 Fixes from the verification run of 1.25.0 (VME lab, VME 9.0.2, layout 1.3, agent 3.3.0, 2026-11-11: host reboot, host

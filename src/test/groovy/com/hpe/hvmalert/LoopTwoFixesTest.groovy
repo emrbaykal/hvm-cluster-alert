@@ -84,7 +84,7 @@ class LoopTwoFixesTest {
     }
 
     @Test
-    void m3AcknowledgedOpenAlarmStaysOpenUntilItClears() {
+    void m3AcknowledgedAlarmLeavesTheOpenList() {
         ComputeServerGroup c = new ComputeServerGroup(id: 1L, name: 'c1')
         OperationNotification a = new OperationNotification(id: 9L, category: 'mvm.alarm.1', name: 'Host unreachable', status: 'error', active: true)
         alarms = [a]
@@ -93,10 +93,11 @@ class LoopTwoFixesTest {
         assertTrue(st.active.containsKey('alarm:9'))
         a.acknowledged = true
         st.update(cycle(st).nativeAlarms([c], [:]), 120000L)
-        assertTrue('acknowledged = seen, not resolved', st.active.containsKey('alarm:9'))
+        assertFalse('acknowledged in VME (1.25.2): leaves the open list at once', st.active.containsKey('alarm:9'))
+        assertEquals(['alarm:9'] as Set, st.acknowledged)
         alarms = []
         st.update(cycle(st).nativeAlarms([c], [:]), 240000L)
-        assertFalse(st.active.containsKey('alarm:9'))
+        assertEquals('cleared: no longer remembered', [] as Set, st.acknowledged)
         alarms = [new OperationNotification(id: 10L, category: 'mvm.alarm.1', name: 'old', status: 'warning', active: true, acknowledged: true)]
         assertEquals('acknowledged before the monitor saw it', [], cycle(new AlertState()).nativeAlarms([c], [:]))
     }

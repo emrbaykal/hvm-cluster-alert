@@ -707,12 +707,16 @@ class AlertCycle {
     List<Finding> nativeAlarms(List<ComputeServerGroup> clusters, Map<Long, Set<Long>> maintenance) {
         Map<String, ComputeServerGroup> byId = clusters.collectEntries { [(it.id.toString()): it] }
         List<OperationNotification> alarms = morpheus.services.operationNotification.list(new DataQuery().withFilter('active', true))
-        alarms.findResults { OperationNotification a ->
+        Set<String> acked = [] as Set
+        List<Finding> found = alarms.findResults { OperationNotification a ->
             String cat = a.category ?: ''
             if (!cat.startsWith('mvm.alarm.')) return null
-            // Acknowledged means seen, not resolved (operations/alarms.rst:34): an alarm already open stays open until it
-            // clears; one acknowledged before this monitor saw it is not relayed (VME cluster ALARMS counts unacknowledged).
-            if (a.acknowledged == true && !state?.active?.containsKey("alarm:${a.id}".toString())) return null
+            // Acknowledged in VME: the operator has taken it (Emre, 2026-11-16: acknowledged alarms stayed in the list and the
+            // daily mail for days). It leaves the open list; a row already mailed resolves once, marked "acknowledged in VME"
+            if (a.acknowledged == true) {
+                acked << "alarm:${a.id}".toString()
+                return null
+            }
             ComputeServerGroup c = byId[cat.substring('mvm.alarm.'.length())]
             if (c == null) return null
             if (a.refType?.equalsIgnoreCase('computeServer') && a.refId != null && maintenance[c.id]?.contains(a.refId)) return null
@@ -720,7 +724,9 @@ class AlertCycle {
             new Finding(key: "alarm:${a.id}", severity: (st in ['error', 'critical', 'failed']) ? Finding.CRITICAL : Finding.WARNING,
                     clusterId: c.id, cluster: c.name, resource: a.resourceName ?: "${a.refType}:${a.refId}",
                     title: a.name ?: 'HVM alarm', detail: a.statusMessage ?: '', source: 'native-alarm',
-                    since: a.startDate ?: new Date(), meta: [acknowledged: a.acknowledged == true])
+                    since: a.startDate ?: new Date())
         }
+        if (state != null) state.acknowledged = acked
+        found
     }
 }

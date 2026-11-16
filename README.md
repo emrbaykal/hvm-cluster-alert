@@ -91,8 +91,9 @@ with the error and the next try. It is known only on the node that runs the chec
   - Clearing the box on the cluster the template came from removes the template, after a confirmation.
   - A template must watch. To pause only its source cluster, first save the template from another cluster.
 - A cluster with neither its own settings nor a template is not watched. The tab says which settings apply.
-- An HVM alarm acknowledged in VME while it is open stays in the list, marked "(acknowledged)", until it clears. An
-  alarm acknowledged before the plugin saw it is not listed or mailed.
+- An HVM alarm acknowledged in VME leaves the open problems list and the daily mail at the next check. If it was
+  already mailed, the next mail lists it once as RESOLVED, marked "(acknowledged in VME)". An alarm acknowledged before
+  the plugin saw it is not listed or mailed. If the problem comes back and VME opens a new alarm, it is mailed again.
 - Recipients must be plain addresses (`name@domain.tld`, what jakarta.mail parses).
 
 ## What it watches

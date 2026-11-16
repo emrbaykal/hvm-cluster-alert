@@ -239,14 +239,14 @@ class AlertScheduler {
                 // like the started mail, wait until problems could be confirmed after a reload or a settings change
                 if (cm.cycles < AlertState.CONFIRM_CYCLES) return
                 // what changed against what the recipients were told before the mute: cleared and changed rows too
-                AlertState.Diff d = cm.announced == null ? null : AlertState.diff(cm.notified, open)
+                AlertState.Diff d = cm.announced == null ? null : AlertState.diff(cm.notified, open, state.acknowledged)
                 m = MailComposer.muteEnded(open, events, node, name, cm.mutedSince, off, d)
             } else if (cm.announced != rule.fingerprint) {
                 // a new or changed rule: summarize once problems could be confirmed (CONFIRM_CYCLES cycles)
                 if (cm.cycles < AlertState.CONFIRM_CYCLES) return
                 m = MailComposer.started(open, events, node, name, off)
             } else {
-                AlertState.Diff d = AlertState.diff(cm.notified, open)
+                AlertState.Diff d = AlertState.diff(cm.notified, open, state.acknowledged)
                 d.events = events
                 if (!d.isEmpty()) {
                     m = MailComposer.change(d, node, open)
