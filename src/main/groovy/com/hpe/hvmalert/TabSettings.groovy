@@ -11,6 +11,8 @@ import groovy.json.JsonSlurper
  * in the tenant that owns the cluster, so the plugin writes no Morpheus object:
  *   secret/hvm-cluster-alert/cluster-<id>    one cluster's own settings
  *   secret/hvm-cluster-alert/new-clusters    the template for clusters without their own settings
+ *   secret/hvm-cluster-alert/mute-<id>       one cluster's mute (Mute on the tab)
+ *   secret/hvm-cluster-alert/form-key        the tenant's form-token signing key (FormToken)
  * An admin sees the keys under Tools > Cypher; removing one there has the same effect as in the tab. Anyone with Cypher
  * access in that tenant can change or delete them there, and the plugin does not log such changes.
  */

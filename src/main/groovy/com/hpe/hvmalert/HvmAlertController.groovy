@@ -142,6 +142,10 @@ class HvmAlertController implements PluginController {
         List<String> bad = rcpt.findAll { !(it ==~ TabSettings.EMAIL) }
         if (bad) return reply(400, false, "Not a mail address: ${bad.take(5).join(', ')}".toString())
         long now = System.currentTimeMillis()
+        // atomic: of two requests at once only one takes the slot; checked before the user's quota, so a "wait" answer costs none
+        if (lastTest.compute(cluster.id) { Long k, Long v -> (v == null || now - v >= TEST_GAP_MS) ? now : v } != now) {
+            return reply(429, false, 'A test mail was just sent; wait 30 seconds.')
+        }
         String uk = who
         boolean userOk = true
         userTests.compute(uk) { String k, List<Long> v ->
@@ -149,10 +153,9 @@ class HvmAlertController implements PluginController {
             if (l.size() >= TEST_PER_USER_HOUR) { userOk = false; return l }
             l + [now]
         }
-        if (!userOk) return reply(429, false, "At most ${TEST_PER_USER_HOUR} test mails per user per hour.".toString())
-        // atomic: of two requests at once only one takes the slot
-        if (lastTest.compute(cluster.id) { Long k, Long v -> (v == null || now - v >= TEST_GAP_MS) ? now : v } != now) {
-            return reply(429, false, 'A test mail was just sent; wait 30 seconds.')
+        if (!userOk) {
+            lastTest.remove(cluster.id, now)      // nothing went out: the cluster slot is free for another user
+            return reply(429, false, "At most ${TEST_PER_USER_HOUR} test mails per user per hour.".toString())
         }
         ApplianceMailer mailer = this.mailer ?: (plugin as HvmClusterAlertPlugin)?.scheduler?.mailer ?: new ApplianceMailer()
         Map m = MailComposer.test(AlertScheduler.hostName(), cluster.name, who)

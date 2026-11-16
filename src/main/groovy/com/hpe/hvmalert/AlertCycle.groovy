@@ -74,6 +74,8 @@ class AlertCycle {
         int expectedGfs2
         List<Map> apdCandidates = []             // consecutive heartbeat-failure runs found this cycle
         Set<String> otherHostNames = [] as Set   // short names of the cluster's hosts not in maintenance
+        Set<String> otherHostIps = [] as Set     // manager addresses of those hosts
+        Map<String, Long> peerHost = [:]         // short peer name -> maintenance host id, or 0 for another host, by address (this cycle)
         Map<String, List<String>> fenceReachable = [:]   // host name -> nodes its fresh quorum line shows awaiting a fence while reachable
         Set<String> freshQuorum = [] as Set               // hosts that logged a new quorum line since the last read
     }
@@ -142,6 +144,11 @@ class AlertCycle {
 
         Map<Long, Set<Long>> maintenance = work.collectEntries { [(it.cluster.id): it.maintenanceHosts.collect { m -> m.id as Long } as Set] }
         List<ComputeServerGroup> relay = clusters.findAll { s.ruleForId(it.id).relayNativeAlarms }
+        // a cluster whose host list failed this cycle: the hosts last seen fully in maintenance, so their expected alarms
+        // do not open for one cycle (the relay itself keeps working while the host list fails)
+        relay.findAll { !maintenance.containsKey(it.id) }.each { ComputeServerGroup c ->
+            maintenance[c.id] = (state?.maintenance ?: [:]).findAll { Long id, Map m -> m.clusterId == c.id && !m.left }.keySet().collect { it as Long } as Set<Long>
+        }
         if (relay) {
             try {
                 o.findings.addAll(nativeAlarms(relay, maintenance))
@@ -211,6 +218,7 @@ class AlertCycle {
                 return
             }
             w.otherHostNames.addAll(names)
+            w.otherHostIps.addAll([h.externalIp, h.internalIp].findAll { it }.collect { it as String })
             state.maintenanceLeft(h.id)
             boolean reachable = managerHostChecks(c, h, w.rule, nowMs, o)
             if (w.rule.hostChecks) {
@@ -224,9 +232,10 @@ class AlertCycle {
     void finish(Work w, Map<Long, Object> results, Outcome o) {
         w.runHosts.each { ComputeServer h -> hostResult(w, h, results[h.id], o) }
         long nowMs = System.currentTimeMillis()
+        w.peerHost = peerHosts(w, o.findings)              // before the drop, which removes the rows that resolved to a maintenance host
         if (w.maintenanceHosts) {
             maintenanceUnreachable(w, o, nowMs)          // before the drop: the survivors' peer findings are evidence
-            dropMaintenanceFindings(w.cluster.id, w.maintenanceHosts, o.findings)
+            dropMaintenanceFindings(w.cluster.id, w.maintenanceHosts, o.findings, w.otherHostIps, w.otherHostNames)
         }
         evaluateApd(w, o, nowMs)
         dropMaintenanceEvents(w, o, nowMs)               // after evaluateApd, which reads these events as peer loss
@@ -237,7 +246,6 @@ class AlertCycle {
     static final Set<String> FENCING_RULES = ['hb-all', 'fence-refused', 'dlm-member-lost', 'quorum-lost', 'self-fence'] as Set
     static final long FENCING_EVENT_AGE_MS = 3 * 60000L
 
-    /** True while this cycle shows DLM possibly blocked: then the scheduler checks again after 30 s. */
     /** Findings open longer than this no longer drive the fast re-check (a service left stopped on purpose). */
     static final long FENCING_FINDING_MAX_AGE_MS = 10 * 60000L
     /** A "GFS2 blocked" row stays open this long after its last signal, unless a fresh quorum line shows it cleared. */
@@ -317,11 +325,98 @@ class AlertCycle {
 
     static final String MAINT_RULE_TITLE = 'Host in maintenance not reachable'
 
-    /** @return true when the agent-log line names the host (short name, FQDN or the agent's "-<n>" suffix) */
-    static boolean namesHost(String line, Collection<String> names) {
+    /**
+     * @param suffix also accept the agent's "-<dlmNodeId>" suffix (quorum names)
+     * @param nodeId accept only this suffix ("-<nodeId>"), when the line gives the node id
+     * @return true when the agent-log line names the host (short name, FQDN, or with the suffix)
+     */
+    static boolean namesHost(String line, Collection<String> names, boolean suffix = true, String nodeId = null) {
+        String tail = nodeId ? "(?:-${nodeId})?" : (suffix ? '(?:-\\d+)?' : '')
         names.any { String n ->
-            n && (line =~ /(?i)(?<![A-Za-z0-9-])${java.util.regex.Pattern.quote(n)}(?:-\d+)?(?![A-Za-z0-9-])/).find()
+            n && (line =~ /(?i)(?<![A-Za-z0-9-])${java.util.regex.Pattern.quote(n)}${tail}(?![A-Za-z0-9-])/).find()
         }
+    }
+
+    /** Rules whose lines name hosts by their quorum name ("Host vmenode03-3 is unreachable", fence_ack "for node X (dlmNodeId=n)").
+     *  The other rules use the bare host name ("Host vmenode01 is offline, moving vms", field 2026-11), where "hv-2" is host
+     *  hv-2, never host hv with a suffix. */
+    static final Set<String> QUORUM_NAME_RULES = ['peer-unreachable', 'fence-ack'] as Set
+
+    /**
+     * namesHost for an event line: the "-<n>" suffix only on rules that carry the quorum name. A quorum name can also be bare
+     * (fence_ack "for unreachable node vmenode01 (dlmNodeId=1)" next to "vmenode02-2 (dlmNodeId=2)", VME lab 2026-11-11), so on
+     * a fence_ack line that gives the node id only "-<that id>" counts as the suffix.
+     */
+    static boolean eventNamesHost(Finding e, Collection<String> names) {
+        String line = e.detail ?: ''
+        if (e.meta?.rule == 'fence-ack') {
+            def id = line =~ /dlmNodeId=(\d+)/
+            return namesHost(line, names, false, id.find() ? id.group(1) : null)
+        }
+        namesHost(line, names, QUORUM_NAME_RULES.contains(e.meta?.rule))
+    }
+
+    /**
+     * True when another host's event line is about maintenance host hid. The node name of a "taking action" or fence_ack line
+     * follows this cycle's peer row of that name when an address resolved the row (to this host, or to another one). The
+     * fence_ack node id does not settle it: "hv-2 (dlmNodeId=2)" is host hv with node id 2 or host hv-2 with a bare quorum
+     * name. Without such a row, a name that fits only with the suffix and is also another host's own name ("hv-2" for host
+     * hv in maintenance, while host hv-2 exists) is ambiguous and the line is kept, so it is mailed.
+     */
+    static boolean eventAbout(Finding e, Long hid, Collection<String> names, Work w) {
+        if (!eventNamesHost(e, names)) return false
+        String re = e.meta?.rule == 'peer-unreachable' ? /(?i)\bhost (\S+) is unreachable, taking action/ :
+                e.meta?.rule == 'fence-ack' ? /(\S+)\s+\(dlmNodeId=\d+\)/ : null
+        if (re == null) return true
+        def m = (e.detail ?: '') =~ re
+        if (!m.find()) return true
+        String n = shortName(m.group(1))
+        if (w.peerHost.containsKey(n)) return w.peerHost[n] == hid
+        Set<String> mine = names.collect { shortName(it as String) } as Set
+        mine.contains(n) || !otherNames(w, mine).contains(n)
+    }
+
+    /** Short names of the cluster's hosts other than these (hosts not in maintenance and the other maintenance hosts). */
+    static Set<String> otherNames(Work w, Set<String> mine) {
+        ((w.otherHostNames ?: []) + w.maintenanceHosts.collectMany { (it.names ?: []) as Collection }).collect { shortName(it as String) } as Set<String> - mine
+    }
+
+    /** Peer rows an address resolved: short peer name -> maintenance host id, or 0 when the address is another host's. */
+    static Map<String, Long> peerHosts(Work w, List<Finding> findings) {
+        Set<String> known = knownIps(w.maintenanceHosts, w.otherHostIps)
+        Map<String, Long> out = [:]
+        findings.findAll { it.clusterId == w.cluster.id && it.key.startsWith('hc:') && it.meta.peer && it.meta.addresses }.each { Finding f ->
+            List addr = (f.meta.addresses ?: []) as List
+            Map m = w.maintenanceHosts.find { byAddress(it, addr, known) == Boolean.TRUE }
+            if (m != null) out[shortName(f.meta.peer as String)] = m.id as Long
+            else if (addr.any { known.contains(it?.toString()) }) out[shortName(f.meta.peer as String)] = 0L
+        }
+        out
+    }
+
+    /**
+     * True when a peer name or address reported by a host means maintenance host m. An address known to the manager decides
+     * (the suffix is the DLM node id, and a quorum name can also be bare, so "hv-2" can be host hv with node id 2 or host
+     * hv-2); the name is used only when the address matches no host of the cluster. A name that fits m only with the suffix
+     * and is also another host's own name is ambiguous: it is not taken for m, so the row is mailed.
+     * @param knownIps manager addresses of every host of the cluster (maintenance hosts included)
+     * @param otherNames short names of the cluster's other hosts
+     */
+    static boolean isHost(Map m, String name, List addresses, Set<String> knownIps, Set<String> otherNames = [] as Set) {
+        Boolean a = byAddress(m, addresses, knownIps)
+        if (a != null) return a
+        if (name == null) return false
+        String n = shortName(name)
+        Set<String> mine = (m.names as Set).collect { shortName(it as String) } as Set
+        mine.contains(n) || (mine.any { sameHost(n, it) } && !otherNames.contains(n))
+    }
+
+    /** @return true when an address is m's, false when it is another known host's, null when no address decides */
+    static Boolean byAddress(Map m, List addresses, Set<String> knownIps) {
+        List<String> addr = (addresses ?: []).collect { it?.toString() }
+        if (addr.any { ((m.ips ?: []) as Set).contains(it) }) return true
+        if (addr.any { knownIps.contains(it) }) return false
+        null
     }
 
     /**
@@ -335,22 +430,22 @@ class AlertCycle {
     void maintenanceUnreachable(Work w, Outcome o, long nowMs) {
         Long cid = w.cluster.id
         int warnMin = w.rule.agentWarnMinutes
+        Set<String> knownIps = knownIps(w.maintenanceHosts, w.otherHostIps)
         w.maintenanceHosts.findAll { it.full }.each { Map m ->
             Set<String> names = m.names as Set<String>
-            Set<String> ips = (m.ips ?: []) as Set<String>
+            Set<String> others = otherNames(w, names.collect { shortName(it) } as Set<String>)
             List<String> why = []
             if (m.off) why << "power state ${m.power ?: 'unknown'}".toString()
             boolean silent = m.silentMin != null && (m.silentMin as long) >= warnMin
             if (silent) why << "agent silent for ${m.silentMin} min".toString()
             List<String> reporters = o.findings.findAll { Finding f ->
                 f.clusterId == cid && f.key.startsWith('hc:') && (
-                        (f.meta.peer && names.any { sameHost(f.meta.peer as String, it) }) ||
-                        ((f.meta.addresses ?: []) as List).any { ips.contains(it?.toString()) } ||
-                        ((f.meta.hosts ?: []) as List).any { hn -> names.any { sameHost(hn as String, it) } })
+                        ((f.meta.peer || f.meta.addresses) && isHost(m, f.meta.peer as String, (f.meta.addresses ?: []) as List, knownIps, others)) ||
+                        ((f.meta.hosts ?: []) as List).any { hn -> isHost(m, hn as String, [], knownIps, others) })
             }.collect { it.resource as String }.unique()
             if (reporters) why << "not reached by ${reporters.join(', ')}".toString()
             boolean loggedLoss = o.events.any { Finding e ->
-                e.clusterId == cid && (e.meta.rule in ['peer-unreachable', 'failover']) && namesHost(e.detail ?: '', names)
+                e.clusterId == cid && (e.meta.rule in ['peer-unreachable', 'failover']) && eventAbout(e, m.id as Long, names, w)
             }
             if (loggedLoss && !reporters) why << 'reported unreachable in the agent log of another host'
             if (!why) return
@@ -391,7 +486,7 @@ class AlertCycle {
             Long t = e.since?.time
             recent.any { Long hid, Map m ->
                 inPeriod(m, t) && (e.key.startsWith("event:${hid}:") ||
-                        (NAMED_DROP_RULES.contains(e.meta.rule) && namesHost(e.detail ?: '', m.names as Set<String>)))
+                        (NAMED_DROP_RULES.contains(e.meta.rule) && eventAbout(e, hid, m.names as Set<String>, w)))
             }
         }
         Set<Long> maintIds = recent.keySet()
@@ -404,7 +499,7 @@ class AlertCycle {
         o.events.removeIf { Finding e ->
             if (e.clusterId != cid || !FENCE_WINDOW_RULES.contains(e.meta.rule)) return false
             // the logging host names itself in its own heartbeat lines ("... for host node1, on all heartbeat targets")
-            if (namesHost(e.detail ?: '', w.otherHostNames - [shortName(e.resource)])) return false
+            if (eventNamesHost(e, w.otherHostNames - [shortName(e.resource)])) return false
             Long t = e.since?.time
             recent.values().any { Map m ->
                 m.firstDownMs != null && inPeriod(m, t) && Math.abs(t - (m.firstDownMs as long)) <= AlertState.PEER_LOSS_WINDOW_MS
@@ -416,17 +511,25 @@ class AlertCycle {
      * Other hosts still see a host in maintenance as a quorum member (host_maintenance.rst:119-121). What they
      * report about it is dropped: findings naming it, and node-count findings up to the number of
      * maintenance hosts that are themselves unreachable (powered off, or named down or unreached by a peer).
+     * @param otherIps manager addresses of the cluster's hosts not in maintenance (see isHost)
+     * @param otherNames short names of the cluster's hosts not in maintenance (see isHost)
      */
-    static void dropMaintenanceFindings(Long clusterId, List<Map> maintenanceHosts, List<Finding> findings) {
+    static void dropMaintenanceFindings(Long clusterId, List<Map> maintenanceHosts, List<Finding> findings, Set<String> otherIps = [] as Set,
+                                        Set<String> otherNames = [] as Set) {
         List<Finding> mine = findings.findAll { it.clusterId == clusterId && it.key.startsWith('hc:') }
-        List<String> named = (mine.collectMany { (it.meta.hosts ?: []) as List } +
-                mine.findAll { it.meta.peer }.collect { it.meta.peer }).collect { it as String }
-        Set<String> namedIps = mine.collectMany { (it.meta.addresses ?: []) as List }.collect { it.toString() } as Set
+        Set<String> known = knownIps(maintenanceHosts, otherIps)
+        List<Finding> peers = mine.findAll { it.meta.peer || it.meta.addresses }
+        List<String> named = mine.collectMany { (it.meta.hosts ?: []) as List }.collect { it as String }
+        Set<String> allNames = ((otherNames ?: []) + maintenanceHosts.collectMany { (it.names ?: []) as Collection }).collect { shortName(it as String) } as Set<String>
+        Closure<Boolean> isM = { Map m, String name, List addresses ->
+            isHost(m, name, addresses, known, allNames - (m.names as Collection).collect { shortName(it as String) })
+        }
         def isMaint = { String name, List addresses ->
-            maintenanceHosts.any { m -> (m.names as Set).any { sameHost(name, it as String) } || ((m.ips ?: []) as Set).any { ip -> (addresses ?: []).contains(ip) } }
+            maintenanceHosts.any { m -> isM(m, name, addresses) }
         }
         int unreachable = maintenanceHosts.count { m ->
-            m.off || m.down || (m.names as Set).any { mn -> named.any { sameHost(it, mn as String) } } || ((m.ips ?: []) as Set).any { namedIps.contains(it) }
+            m.off || m.down || named.any { isM(m, it, []) } ||
+                    peers.any { isM(m, it.meta.peer as String, (it.meta.addresses ?: []) as List) }
         } as int
         findings.removeIf { Finding f ->
             if (f.clusterId != clusterId || !f.key.startsWith('hc:')) return false
@@ -435,6 +538,10 @@ class AlertCycle {
             if (f.meta.hosts) return (f.meta.hosts as List).every { isMaint(it as String, []) }
             false
         }
+    }
+
+    static Set<String> knownIps(List<Map> maintenanceHosts, Set<String> otherIps) {
+        (maintenanceHosts.collectMany { ((it.ips ?: []) as Collection).collect { ip -> ip as String } } + (otherIps ?: [])) as Set<String>
     }
 
     static final Set<String> STORAGE_EVENT_RULES = ['apd-budget', 'apd-shutdown', 'apd'] as Set
@@ -617,6 +724,20 @@ class AlertCycle {
         }
     }
 
+    /**
+     * Why the agent call failed, for the "Host checks could not run" row: the timeout text when a TimeoutException is in
+     * the cause chain (Future.get at the deadline, or RxJava's timeout wrapped by blockingGet and the executor), otherwise
+     * the first cause under those wrappers.
+     */
+    static String failureText(Throwable t) {
+        for (Throwable c = t; c != null; c = c.cause) {
+            if (c instanceof java.util.concurrent.TimeoutException) return "no answer from the agent within ${HOST_CHECK_TIMEOUT_S} s"
+        }
+        Throwable root = t
+        while (root.cause != null && (root instanceof java.util.concurrent.ExecutionException || root.class == RuntimeException)) root = root.cause
+        "${root.class.simpleName}${root.message ? ': ' + root.message : ''}".toString()
+    }
+
     void hostResult(Work w, ComputeServer h, Object result, Outcome o) {
         ComputeServerGroup c = w.cluster
         AlertSettings.ClusterRule s = w.rule
@@ -634,7 +755,7 @@ class AlertCycle {
         if (tr == null || !out) {
             String why = tr ? (tr.error ?: tr.msg ?: 'no output from the agent') :
                     (result instanceof NotStarted ? ((Throwable) result).message :
-                     result instanceof Throwable ? "no answer from the agent within ${HOST_CHECK_TIMEOUT_S} s" : 'no output from the agent')
+                     result instanceof Throwable ? failureText((Throwable) result) : 'no output from the agent')
             o.findings << new Finding(key: "${prefix}exec", severity: Finding.WARNING, clusterId: c.id, cluster: c.name, resource: h.name,
                     title: 'Host checks could not run', detail: why.toString().take(300), source: 'host')
             o.carry << prefix

@@ -69,7 +69,7 @@ with the error and the next try. It is known only on the node that runs the chec
 
 - **Send test mail** sends one mail to the recipients in the form, saved or not. If SMTP fails, or the relay refuses
   some of the addresses, the tab says so at once. Limits: at most 10 addresses, one test mail per cluster every 30
-  seconds, 10 per user per hour.
+  seconds, 10 per user per hour (a "wait 30 seconds" answer does not count).
 - **Planned work: Mute alerts** holds every mail of the cluster for 1, 2, 4, 8 or 24 hours.
   - The recipients get one "alerts muted until ..." mail when it starts, then nothing.
   - When the time is up, or someone clicks **Unmute**, one "mute ended" mail compares with what the recipients were
@@ -233,7 +233,8 @@ down (in a lab restart in maintenance the other hosts' heartbeat writes did not 
 - **Mail**
   - One mail per cluster to its recipients, carrying what is new, what changed severity, what resolved and the events.
     A RESOLVED row shows the problem as it was last mailed.
-  - A failed send loses nothing. The retry waits one interval and doubles per failure, up to an hour.
+  - A failed send loses nothing. The retry waits one interval and doubles per failure, up to 10 minutes. A successful
+    mail to any cluster ends the wait of the others, since they share the appliance's mail relay.
   - A "monitor started" summary goes out on the second check after a start, a takeover, a settings change or a new
     cluster. It includes agent-log events from the 15 minutes before the start, so a failure that also restarted the
     manager VM is still reported.
@@ -251,6 +252,14 @@ down (in a lab restart in maintenance the other hosts' heartbeat writes did not 
     and only while no other host shows a loss of its own; its own agent-log lines from the maintenance period, read when
     it is checked again. The period starts 4 minutes before the host was first seen fully in maintenance and ends 4
     minutes after it was last seen there. A host still evacuating ("maintenancing") keeps its events.
+  - A peer another host reports unreachable is matched to the host in maintenance by its address when the manager knows
+    that address, and by name otherwise. The agent's quorum names add "-<DLM node id>" to some hosts and not to others
+    (vmenode01, vmenode02-2), so with hosts hv and hv-2 the name "hv-2" can be either. When the name fits the host in
+    maintenance only with that suffix and is also another host's own name, and no known address decides, the report is
+    mailed rather than dropped. In agent-log lines the suffix counts only in lines that use quorum names (on a fence_ack
+    line only the suffix that matches its `dlmNodeId`), and a "taking action" or fence_ack line follows the peer row of
+    the same name.
+    In the other lines (HA failover, heartbeat) "hv-2" is host hv-2, not host hv.
   - A host whose check cannot run keeps its open problems; they are not reported as resolved.
 - **Leadership.** A distributed lock picks the node that checks and mails. On a single manager VM that is the manager.
 
@@ -261,7 +270,7 @@ Per check and host:
 - one agent command; the script runs in about 0.06 s and uses 0.05 to 0.07 s of CPU, its largest process about 13 MB of
   memory (measured on layout 1.3 hosts);
 - the agent log, read from the last offset (about 0.5 MB per check on the lab hosts; up to 4 MB on the first check after a
-  start);
+  start); after a rotation by rename (`current.log.1`) the rest of the old file is read first, then the new file;
 - about 2 KB of output back to the manager on a quiet check; the output is capped at roughly 100 KB;
 - every root command runs under `timeout -k 2 6`, and only one copy runs per host (flock).
 

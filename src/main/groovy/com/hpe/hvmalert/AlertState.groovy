@@ -144,8 +144,10 @@ class AlertState {
         active = cur
     }
 
-    /** What changed between what the recipients were told and the current open problems of one cluster. */
-    /** @param acknowledged alarm keys acknowledged in VME: such a row leaves the list and resolves once, marked */
+    /**
+     * What changed between what the recipients were told and the current open problems of one cluster.
+     * @param acknowledged alarm keys acknowledged in VME: such a row leaves the list and resolves once, marked
+     */
     static Diff diff(Map<String, Finding> notified, Collection<Finding> open, Set<String> acknowledged = null) {
         Diff d = new Diff()
         Map<String, Finding> now = open.collectEntries { [(it.key): it] }

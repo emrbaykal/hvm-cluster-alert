@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.25.3
+
+Fixes from a code review (no lab run). What is alerted and the default levels are unchanged.
+
+- **Hosts named `X` and `X-<n>` in one cluster.** While host `hv` was in maintenance, the other hosts' reports about
+  a lost host `hv-2` (its peer row, "taking action", fence_ack, "Host hv-2 is offline, moving vms" and then the heartbeat
+  warnings) could be dropped as if they named `hv`, and `hv` got a wrong reason in its maintenance warning. Now:
+  - a peer row is matched to the maintenance host by its address when the manager knows the address;
+  - by name otherwise, except when the name fits the maintenance host only with the "-<n>" suffix and is also another
+    host's own name: that row is mailed;
+  - in agent-log lines the suffix counts only in lines that carry the quorum name. On a fence_ack line, which gives
+    `dlmNodeId=<n>`, only "-<n>" counts; a "taking action" or fence_ack line follows the peer row of the same name, and is
+    mailed when the name is ambiguous in the same way.
+- **Agent log rotation.** After a rotation by rename (`current.log.1`), the host check first reads the rest of the
+  old file from the last offset, then the new file. Before, lines written between the last check and the rotation were
+  never read.
+- **DLM waiting on a reachable node.** When a quorum line carries both `waitFencing=true` and a reachable node with
+  `needFencing=true`, the row keeps the "still reachable" title and its hold counted from the agent's line.
+- **HVM alarms of hosts in maintenance.** When a cluster's host list could not be read in a check, the alarms of
+  its hosts last seen in maintenance opened and resolved again in the next check. They are now filtered with those
+  hosts.
+- **"Host checks could not run" names the error.** Only a timeout reads "no answer from the agent within 60 s";
+  any other failure of the agent call shows its error.
+- **Test mail limit.** A "wait 30 seconds" answer no longer counts toward the 10 test mails per user per hour.
+- **Mail retry.** The wait after a failed send doubles up to 10 minutes (was an hour), and a successful mail to any
+  cluster ends the wait of the others.
+- **Comments.** Code comments that no longer matched the code were corrected.
+
 ## 1.25.2
 
 - **Acknowledged HVM alarms leave the list.** An HVM alarm acknowledged in VME is no longer kept open until it clears.

@@ -23,7 +23,8 @@ import java.time.Instant
  * - every command runs under timeout(1), so a hung corosync/DLM/multipathd call cannot pile up;
  * - a flock lets only one copy run per host; a copy still running makes the next one exit at once (@@BUSY);
  * - the agent log is read only from the byte offset the previous cycle reached (same inode), so a
- *   cycle reads the few KB written since, not megabytes.
+ *   cycle reads the few KB written since, not megabytes. After a rotation by rename (current.log.1; agent
+ *   3.3.0 rotates daily at 00:00) the rest of the old file is read first, then the new one.
  */
 class HostCheck {
 
@@ -35,9 +36,9 @@ class HostCheck {
      * five times while DLM holds GFS2 until the fence (field HA test); HPE's APD rule is six
      * consecutive failed heartbeat writes (architecture.rst:141, vm_migration.rst:217-222). The script
      * prints the times of these lines on their own (@@LOGDATA "H <ts>") so AlertCycle can derive a
-     * possible APD from a consecutive run; see AlertCycle.evaluateApd. The agent's own APD text has not
-     * been seen, so APD/isolation is matched only on MvmHeartbeatFailover lines. Matching is
-     * case-insensitive in the shell and here.
+     * possible APD from a consecutive run; see AlertCycle.evaluateApd. The agent's own APD text is
+     * matched as agent 3.3.0 logs it (apd-shutdown, apd-budget); HPE's generic APD/isolation phrases are
+     * matched only on MvmHeartbeatFailover lines. Matching is case-insensitive in the shell and here.
      */
     static final List<Map> EVENT_RULES = [
         [id: 'peer-unreachable', re: ~/(?i)is unreachable, taking action/, sev: Finding.CRITICAL, title: 'Peer unreachable, agent is taking action'],
@@ -118,7 +119,7 @@ class HostCheck {
      * commands. Without root the privileged sections are skipped and reported; sudo is never probed (on
      * HVM OS 26.04 a refused "sudo -n" leaves orphaned root processes, lab 2026-11-07).
      */
-    static final String TEMPLATE = '''LI='@LOG_INODE@'; LO=@LOG_OFFSET@; E=@EXPECTED_GFS2@
+    static final String TEMPLATE = '''LI='@LOG_INODE@'; LO=@LOG_OFFSET@; E=@EXPECTED_GFS2@; O=''
 L=@AGENT_LOG@
 if command -v timeout >/dev/null 2>&1; then TO='timeout -k 2 6'; else TO=''; fi
 if [ "$(id -u)" = 0 ]; then M=root; LK=/run/hvm-cluster-alert.lock; else M=none; LK=/tmp/.hvm-cluster-alert.$(id -u).lock; fi
@@ -142,9 +143,13 @@ if [ -n "$CS" ]; then
   if [ "$CI" = "$LI" ] && [ "$LO" -ge 0 ] && [ "$CS" -ge "$LO" ]; then
     if [ $((CS - LO)) -gt @MAX_READ@ ]; then F=@MAX_READ@; else F="+$((LO + 1))"; fi
   elif [ -n "$LI" ]; then F=@MAX_READ@
+    set -- $(R stat -c '%i %s' "$L.1" 2>/dev/null)
+    if [ "$1" = "$LI" ] && [ "$LO" -ge 0 ] && [ "${2:-0}" -gt "$LO" ]; then
+      if [ $(($2 - LO)) -gt @MAX_READ@ ]; then O=@MAX_READ@; else O="+$((LO + 1))"; fi
+    fi
   else F=@FIRST_READ@; fi
   echo '@@LOGDATA'
-  R tail -c "$F" "$L" 2>/dev/null | tail -c @MAX_READ@ | grep -a -i -E 'quorumAchieved=|@CRIT@|@WARN@|@VMOFF@' | sed 's/\\x1b\\[[0-9;]*m//g' | awk -v CR='@CRIT@' '
+  { [ -z "$O" ] || R tail -c "$O" "$L.1" 2>/dev/null; R tail -c "$F" "$L" 2>/dev/null; } | tail -c @MAX_READ@ | grep -a -i -E 'quorumAchieved=|@CRIT@|@WARN@|@VMOFF@' | sed 's/\\x1b\\[[0-9;]*m//g' | awk -v CR='@CRIT@' '
     BEGIN { CR = tolower(CR) }
     !/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ { next }
     /quorumAchieved=/ { q = $0; next }
@@ -330,7 +335,8 @@ echo '@@END'
         parseMultipath(s['MPATH'] ?: [], add)
         r.events = parseEvents(data.findAll { it.startsWith('E ') }.collect { it.substring(2) })
         // Several sources can report the same condition (e.g. quorum from the endpoint and the log): keep one.
-        r.findings = r.findings.groupBy { it.key }.collect { k, v -> v.max { Finding.rank(it.severity) } }
+        // Of equal severity, the one timed from the agent's own line wins (dlm-wait: "still reachable" variant over waitFencing=true).
+        r.findings = r.findings.groupBy { it.key }.collect { k, v -> v.max { Finding.rank(it.severity) * 2 + (it.meta?.observedMs != null ? 1 : 0) } }
         return r
     }
 

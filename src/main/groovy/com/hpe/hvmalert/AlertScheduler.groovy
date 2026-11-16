@@ -22,7 +22,7 @@ class AlertScheduler {
     static final String LOCK = 'hvm-cluster-alert.leader'
     static final long TICK_SECONDS = 30
     static final long DAY_MS = 24L * 3600L * 1000L
-    static final long MAX_MAIL_BACKOFF_MS = 60L * 60000L
+    static final long MAX_MAIL_BACKOFF_MS = 10L * 60000L
 
     enum Leadership { LEADER, FOLLOWER, UNKNOWN }
 
@@ -200,7 +200,8 @@ class AlertScheduler {
     /**
      * One mail per cluster to its own recipients. What the recipients were told moves forward only on a
      * successful send; a failure keeps the changes and events for the next attempt, which waits one
-     * interval, doubling per failure up to an hour.
+     * interval, doubling per failure up to 10 minutes. A successful send to one cluster ends the wait of the others
+     * (they share the appliance's mail relay), so they try again in this cycle or the next.
      */
     void notifyClusters(AlertSettings s, AlertCycle.Outcome o, long now) {
         Map<Long, List<Finding>> openBy = state.active.values().groupBy { it.clusterId }
@@ -259,6 +260,8 @@ class AlertScheduler {
             }
             String error = deliver(rule.recipients, m)
             logRows(name, m, error)
+            // the relay works again: the other clusters stop waiting (those after this one in the loop try now)
+            if (error == null) state.mail.values().each { it.nextAttemptMs = 0 }
             if (error == null && muted) {
                 cm.muteAnnounced = rule.muteUntil
                 if (cm.mutedSince == null) cm.mutedSince = (rule.mutedAt != null && rule.mutedAt <= now) ? rule.mutedAt : now

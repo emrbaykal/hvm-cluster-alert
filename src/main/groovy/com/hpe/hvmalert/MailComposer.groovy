@@ -30,7 +30,7 @@ class MailComposer {
     }
 
     /**
-     * First mail for a cluster after start, takeover or a change of its integration: the open problems
+     * First mail for a cluster after start, takeover or a change of its settings: the open problems
      * as a summary instead of one alert each, plus agent-log events not yet mailed.
      */
     static Map started(List<Finding> open, List<Finding> events, String node, String cluster, List<String> off = []) {
@@ -74,7 +74,6 @@ class MailComposer {
         f.preStart ? 'EARLIER EVENT' : 'EVENT'
     }
 
-    /** Sent when nothing was mailed to a cluster for 24 hours: proves the monitor and the mail path work. */
     /** The cluster is still there but no settings watch it any more: told once to the last recipients. */
     static Map stopped(String node, String cluster) {
         String body = "<p>The settings no longer watch <b>${esc(cluster)}</b> (\"Watch this cluster\" cleared, or its settings or the " +
@@ -82,6 +81,7 @@ class MailComposer {
         [subject: "${PREFIX} ${cluster}: monitor stopped".toString(), html: page('Monitor stopped', body, node).toString(), rows: []]
     }
 
+    /** Sent when nothing was mailed to a cluster for 24 hours: proves the monitor and the mail path work. */
     static Map daily(List<Finding> open, String node, String cluster, List<String> off = []) {
         String intro = "The HVM cluster monitor on ${esc(node)} is running and watches ${esc(cluster)}. "
         intro += open ? "${open.size()} problem(s) are open:" : 'No open problems.'
